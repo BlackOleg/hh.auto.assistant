@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.3)
+// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.4)
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  Умный автоотклик на hh.ru с поддержкой Gemini, Claude и Qwen.
 // @author       HH Auto-Apply Builder
 // @match        https://*.hh.ru/search/*
@@ -15,6 +15,8 @@
 // @connect      generativelanguage.googleapis.com
 // @connect      api.anthropic.com
 // @connect      dashscope.aliyuncs.com
+// @connect      dashscope-intl.aliyuncs.com
+// @connect      api.hh.ru
 // @run-at       document-end
 // ==/UserScript==
 
@@ -51,11 +53,11 @@
         name: 'Anthropic Claude',
         icon: '🟠',
         models: [
-            { id: 'claude-3-5-haiku-latest', name: 'Claude 3.5 Haiku (быстрый)' },
-            { id: 'claude-3-5-sonnet-latest', name: 'Claude 3.5 Sonnet (качественный)' },
-            { id: 'claude-3-opus-latest', name: 'Claude 3 Opus (максимум)' }
+            { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5 (быстрый, дешевый)' },
+            { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5 (качественный)' },
+            { id: 'claude-opus-5-5', name: 'Claude Opus 5.5 (максимум)' }
         ],
-        defaultModel: 'claude-3-5-haiku-latest'
+        defaultModel: 'claude-haiku-4-5'
     },
     qwen: {
         name: 'Alibaba Qwen',
@@ -79,14 +81,18 @@
         geminiApiKey: GM_getValue('autoApplyGeminiApiKey', ""),
         geminiModel: GM_getValue('autoApplyGeminiModel', AI_PROVIDERS.gemini.defaultModel),
         claudeApiKey: GM_getValue('autoApplyClaudeApiKey', ""),
-        claudeModel: GM_getValue('autoApplyClaudeModel', AI_PROVIDERS.claude.defaultModel),
+        // Модели Claude 3.x выведены из эксплуатации и возвращают 404 — переключаем на актуальную
+        claudeModel: (() => {
+            const saved = GM_getValue('autoApplyClaudeModel', AI_PROVIDERS.claude.defaultModel);
+            return AI_PROVIDERS.claude.models.some(m => m.id === saved) ? saved : AI_PROVIDERS.claude.defaultModel;
+        })(),
         qwenApiKey: GM_getValue('autoApplyQwenApiKey', ""),
         qwenModel: GM_getValue('autoApplyQwenModel', AI_PROVIDERS.qwen.defaultModel),
         selectedResumeTitle: GM_getValue('autoApplySelectedResume', RESUME_LIST[0] || DEFAULT_RESUMES[0]),
         questionsAction: GM_getValue('autoApplyQuestionsAction', "notify"),
         autoConfirmRegion: GM_getValue('autoApplyAutoConfirmRegion', true),
         aiTemperature: GM_getValue('autoApplyAiTemperature', 0.7),
-        aiMaxTokens: GM_getValue('autoApplyAiMaxTokens', 500)
+        aiMaxTokens: GM_getValue('autoApplyAiMaxTokens', 1000)
     };
 
     let state = {
@@ -117,7 +123,7 @@
             reason: reason || ''
         };
         state.logs.unshift(logEntry);
-        if (state.logs.length > 100) state.logs.pop();
+        if (state.logs.length > 200) state.logs.length = 200;
         saveState();
     }
 
@@ -180,7 +186,7 @@
             text.textContent = resume;
             text.style.cssText = 'color: #f3f4f6; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 8px;';
             const deleteBtn = document.createElement('button');
-            deleteBtn.textContent = '';
+            deleteBtn.textContent = '🗑️';
             deleteBtn.style.cssText = 'background: #dc2626; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;';
             deleteBtn.onclick = () => {
                 if (confirm(`Удалить резюме "${resume}"?`)) {
@@ -196,372 +202,227 @@
         });
     }
 
+    const SCRIPT_VERSION = '5.4';
+
+    function escapeHtml(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function fillTemplate(jobTitle, companyName) {
+        return CONFIG.coverLetterTemplate
+            .replace(/{vacancy_title}/g, jobTitle)
+            .replace(/{company_name}/g, companyName);
+    }
+
+    // \b в JS-регулярках работает только для ASCII, поэтому кириллические слова
+    // считаем без границ слова (раньше кириллица не находилась вовсе и любая
+    // русская вакансия с парой английских терминов определялась как английская).
     function detectLanguage(text) {
         if (!text) return 'ru';
-        const cleanText = text.replace(/<[^>]*>/g, ' ').replace(/[^\w\sа-яА-ЯёЁa-zA-Z]/g, ' ');
-        const cyrillicWords = cleanText.match(/\b[а-яА-ЯёЁ]+\b/g) || [];
-        const latinWords = cleanText.match(/\b[a-zA-Z]+\b/g) || [];
+        const cleanText = text.replace(/<[^>]*>/g, ' ');
+        const cyrillicWords = cleanText.match(/[а-яё]{2,}/gi) || [];
+        const latinWords = cleanText.match(/[a-z]{2,}/gi) || [];
         const totalWords = cyrillicWords.length + latinWords.length;
         if (totalWords === 0) return 'ru';
         return (latinWords.length / totalWords) > 0.6 ? 'en' : 'ru';
     }
 
-   // Замените функцию fetchVacancyDescription на эту:
-async function fetchVacancyDescription(url) {
-    if (!url) {
-        addLog('info', 'System', 'Fetch', '-', '⚠️ URL вакансии не найден');
-        return '';
+    function getVacancyId(url) {
+        const match = String(url || '').match(/\/vacancy\/(\d+)/) || String(url || '').match(/vacancyId=(\d+)/);
+        return match ? match[1] : null;
     }
 
-    addLog('info', 'System', 'Fetch', '-', `📥 Загрузка с URL: ${url}`);
+    function htmlToText(html) {
+        if (!html) return '';
+        const doc = new DOMParser().parseFromString(`<div>${html}</div>`, 'text/html');
+        doc.querySelectorAll('li').forEach(li => li.insertBefore(doc.createTextNode('• '), li.firstChild));
+        doc.querySelectorAll('br, p, li, div, h1, h2, h3, h4, ul, ol').forEach(el => el.appendChild(doc.createTextNode('\n')));
+        return (doc.body.textContent || '').replace(/[ \t ]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
+    }
 
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000);
-        const response = await fetch(url, { signal: controller.signal });
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-            addLog('info', 'System', 'Fetch', '-', ` HTTP ошибка: ${response.status}`);
-            return '';
-        }
-
-        const html = await response.text();
-        addLog('info', 'System', 'Fetch', '-', `📄 HTML загружен: ${html.length} символов`);
-
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(html, 'text/html');
-
-        // Пробуем разные селекторы
+    // Достает описание вакансии и ключевые навыки из документа страницы вакансии.
+    function extractDescriptionFromDoc(doc) {
+        let description = '';
         const selectors = [
             '[data-qa="vacancy-description"]',
             '.vacancy-description',
-            '[data-qa="vacancy-content"]',
-            '.vacancy-content',
-            '[data-qa="vacancy-section-experience"]',
-            '[class*="description"]'
+            '[data-qa="vacancy-branded"]',
+            '.vacancy-branded-user-content'
         ];
-
-        let description = '';
-        let usedSelector = '';
-
         for (const selector of selectors) {
             const el = doc.querySelector(selector);
-            if (el) {
-                description = el.innerText.trim();
-                usedSelector = selector;
-                break;
+            if (el && el.innerHTML.trim()) {
+                description = htmlToText(el.innerHTML);
+                if (description) break;
             }
         }
 
-        if (description) {
-            addLog('info', 'System', 'Fetch', '-', `✅ Описание найдено (${usedSelector}): ${description.length} симв.`);
-            addLog('info', 'System', 'Fetch', '-', `📝 Начало: "${description.substring(0, 150)}..."`);
-        } else {
-            addLog('info', 'System', 'Fetch', '-', '⚠️ Описание не найдено ни по одному селектору');
-            // Покажем что есть на странице
-            const bodyText = doc.body ? doc.body.innerText.substring(0, 200) : '';
-            addLog('info', 'System', 'Fetch', '-', `🔍 Содержимое страницы: "${bodyText}..."`);
+        // Запасной вариант: hh.ru кладет состояние страницы в JSON внутри <template id="HH-Lux-InitialState">
+        if (!description) {
+            const stateEl = doc.querySelector('#HH-Lux-InitialState, template[id*="InitialState"]');
+            if (stateEl) {
+                try {
+                    const json = JSON.parse(stateEl.innerHTML || stateEl.textContent);
+                    const view = json.vacancyView || {};
+                    description = htmlToText(view.description || (view.branding && view.branding.description) || '');
+                } catch (e) { /* формат мог поменяться */ }
+            }
         }
 
+        const skills = Array.from(doc.querySelectorAll('[data-qa="skills-element"], [data-qa="bloko-tag__text"]'))
+            .map(el => el.textContent.trim()).filter(Boolean);
+        const uniqueSkills = [...new Set(skills)];
+        if (description && uniqueSkills.length) {
+            description += `\n\nКлючевые навыки: ${uniqueSkills.join(', ')}`;
+        }
         return description;
-    } catch (e) {
-        console.warn("Failed to fetch vacancy description:", e);
-        addLog('info', 'System', 'Fetch', '-', `❌ Ошибка загрузки: ${e.message}`);
-        return '';
     }
-}
 
-// Замените функцию buildPrompt на эту:
- function buildPrompt(jobTitle, companyName, vacancyDescription) {
-    const detectedLang = detectLanguage(vacancyDescription + " " + jobTitle);
-    const isEnglish = detectedLang === 'en';
+    function fetchFromHhApi(vacancyId) {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://api.hh.ru/vacancies/${vacancyId}`,
+                headers: { 'Accept': 'application/json' },
+                timeout: 15000,
+                onload: (response) => {
+                    if (response.status < 200 || response.status >= 300) {
+                        addLog('info', 'System', 'Fetch', '-', `⚠️ api.hh.ru вернул ${response.status}`);
+                        resolve('');
+                        return;
+                    }
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        let text = htmlToText(data.description || '');
+                        const skills = (data.key_skills || []).map(s => s.name).filter(Boolean);
+                        if (text && skills.length) text += `\n\nКлючевые навыки: ${skills.join(', ')}`;
+                        resolve(text);
+                    } catch (e) {
+                        resolve('');
+                    }
+                },
+                onerror: () => resolve(''),
+                ontimeout: () => resolve('')
+            });
+        });
+    }
 
-    // Логируем что отправляем в ИИ
-    addLog('info', 'System', 'Prompt', '-', `🌍 Язык определен: ${isEnglish ? 'English' : 'Русский'}`);
-    addLog('info', 'System', 'Prompt', '-', `📊 Длина описания: ${vacancyDescription ? vacancyDescription.length : 0} симв.`);
+    async function fetchVacancyDescription(url) {
+        const vacancyId = getVacancyId(url);
+        if (!url || !vacancyId) {
+            addLog('info', 'System', 'Fetch', '-', `⚠️ Не удалось определить ID вакансии по ссылке: ${url || 'нет ссылки'}`);
+            return '';
+        }
 
-    if (isEnglish) {
-        return {
-            lang: 'en',
-            system: `You are an expert career coach and professional job applicant. You write compelling, concise cover letters tailored to specific job requirements.`,
-            user: `You are applying for the position of "${jobTitle}" at "${companyName}".
+        // 1. Мы уже на странице этой вакансии — читаем прямо из DOM.
+        if (getVacancyId(location.href) === vacancyId) {
+            const fromPage = extractDescriptionFromDoc(document);
+            if (fromPage) {
+                addLog('info', 'System', 'Fetch', '-', `✅ Описание взято со страницы: ${fromPage.length} симв.`);
+                return fromPage;
+            }
+        }
 
-VACANCY DESCRIPTION (analyze these requirements carefully):
-${vacancyDescription || "No detailed description provided. Focus on the job title."}
+        // 2. Загружаем HTML страницы вакансии с того же домена (ссылка из выдачи может вести на другой поддомен).
+        const pageUrl = `${location.origin}/vacancy/${vacancyId}`;
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000);
+            const response = await fetch(pageUrl, { signal: controller.signal, credentials: 'include' });
+            clearTimeout(timeoutId);
+            if (response.ok) {
+                const html = await response.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const description = extractDescriptionFromDoc(doc);
+                if (description) {
+                    addLog('info', 'System', 'Fetch', '-', `✅ Описание загружено: ${description.length} симв.`);
+                    return description;
+                }
+                addLog('info', 'System', 'Fetch', '-', '⚠️ На странице вакансии описание не найдено, пробую api.hh.ru');
+            } else {
+                addLog('info', 'System', 'Fetch', '-', `⚠️ HTTP ${response.status} при загрузке вакансии, пробую api.hh.ru`);
+            }
+        } catch (e) {
+            addLog('info', 'System', 'Fetch', '-', `⚠️ Ошибка загрузки страницы (${e.message}), пробую api.hh.ru`);
+        }
 
-MY PROFESSIONAL PROFILE:
+        // 3. Публичный API hh.ru.
+        const fromApi = await fetchFromHhApi(vacancyId);
+        if (fromApi) {
+            addLog('info', 'System', 'Fetch', '-', `✅ Описание получено через api.hh.ru: ${fromApi.length} симв.`);
+        } else {
+            addLog('info', 'System', 'Fetch', '-', '❌ Описание вакансии получить не удалось');
+        }
+        return fromApi;
+    }
+
+    function buildPrompt(jobTitle, companyName, vacancyDescription) {
+        const isEnglish = detectLanguage(vacancyDescription + ' ' + jobTitle) === 'en';
+
+        if (isEnglish) {
+            return {
+                lang: 'en',
+                system: 'You are an expert career coach. You write compelling, concise cover letters tailored to a specific vacancy, using only facts from the candidate profile.',
+                user: `I am applying for the position "${jobTitle}" at "${companyName}".
+
+<vacancy_description>
+${vacancyDescription || 'No detailed description provided. Focus on the job title.'}
+</vacancy_description>
+
+<my_profile>
 ${USER_PROFILE}
+</my_profile>
 
-TASK:
-Write a professional, concise cover letter in ENGLISH that:
-1. DIRECTLY addresses the KEY REQUIREMENTS from the vacancy description above
-2. Explicitly mentions 2-3 specific requirements from the vacancy and matches them with my experience
-3. Uses concrete examples from my profile that are MOST RELEVANT to this specific vacancy
-4. Shows enthusiasm for THIS particular role and company
-5. Keeps it concise (3-4 short paragraphs, max 250 words)
-6. Use professional but warm tone
-7. DO NOT use generic phrases - make it specific to THIS vacancy
-8. Output ONLY the cover letter text, no markdown, no quotes, no explanations
-
-Structure:
-- Paragraph 1: Express interest in THIS specific position and mention 1 key requirement
-- Paragraph 2: Match my most relevant experience to 2 key requirements from the vacancy
-- Paragraph 3: Mention additional value I bring and readiness for relocation if applicable
-- Closing: Professional sign-off`
-        };
-    } else {
+Write a cover letter in ENGLISH for THIS vacancy:
+1. Identify the 2-3 most important requirements or tasks from the vacancy description and name them explicitly.
+2. For each one, show matching experience from my profile with concrete facts and numbers.
+3. Mention the company name and why this role is interesting to me.
+4. Use only facts from my profile; do not invent experience, companies or numbers.
+5. 3-4 short paragraphs, at most 200 words, professional but warm tone, no generic filler phrases.
+6. Output only the letter text: no markdown, no quotes, no subject line, no placeholders like [Name].`
+            };
+        }
         return {
             lang: 'ru',
-            system: `Вы — эксперт по карьере и профессиональный соискатель. Вы пишете убедительные, лаконичные сопроводительные письма, адаптированные под конкретные требования вакансии.`,
-            user: `Вы откликаетесь на вакансию "${jobTitle}" в компании "${companyName}".
+            system: 'Вы — эксперт по карьере. Вы пишете убедительные лаконичные сопроводительные письма под конкретную вакансию, используя только факты из профиля кандидата.',
+            user: `Я откликаюсь на вакансию "${jobTitle}" в компании "${companyName}".
 
-ОПИСАНИЕ ВАКАНСИИ (внимательно проанализируйте требования):
-${vacancyDescription || "Подробное описание не предоставлено. Ориентируйтесь на название вакансии."}
+<описание_вакансии>
+${vacancyDescription || 'Подробное описание не предоставлено. Ориентируйтесь на название вакансии.'}
+</описание_вакансии>
 
-МОЙ ПРОФЕССИОНАЛЬНЫЙ ПРОФИЛЬ:
+<мой_профиль>
 ${USER_PROFILE}
+</мой_профиль>
 
-ЗАДАЧА:
-Напишите профессиональное, лаконичное сопроводительное письмо на РУССКОМ языке, которое:
-1. НАПРЯМУЮ отвечает на КЛЮЧЕВЫЕ ТРЕБОВАНИЯ из описания вакансии выше
-2. Явно упоминает 2-3 конкретных требования из вакансии и соотносит их с моим опытом
-3. Использует конкретные примеры из моего профиля, которые НАИБОЛЕЕ РЕЛЕВАНТНЫ этой конкретной вакансии
-4. Показывает заинтересованность именно в ЭТОЙ должности и компании
-5. Сохраняет лаконичность (3-4 коротких абзаца, макс 250 слов)
-6. Используйте профессиональный но теплый тон
-7. НЕ используйте шаблонные фразы - сделайте письмо специфичным для ЭТОЙ вакансии
-8. Выведите ТОЛЬКО текст сопроводительного письма, без markdown, кавычек и объяснений
-
-Структура:
-- Абзац 1: Выразите интерес к ЭТОЙ конкретной позиции и упомяните 1 ключевое требование
-- Абзац 2: Соотнесите мой наиболее релевантный опыт с 2 ключевыми требованиями из вакансии
-- Абзац 3: Упомяните дополнительную ценность которую я приношу и готовность к релокации если применимо
-- Завершение: Профессиональное завершение`
+Напишите сопроводительное письмо на РУССКОМ языке именно под ЭТУ вакансию:
+1. Выделите 2-3 самых важных требования или задачи из описания вакансии и явно их назовите.
+2. Для каждого покажите соответствующий опыт из моего профиля с конкретными фактами и цифрами.
+3. Упомяните название компании и чем мне интересна эта позиция.
+4. Используйте только факты из профиля, не выдумывайте опыт, компании и цифры.
+5. 3-4 коротких абзаца, не более 200 слов, профессиональный и доброжелательный тон, без шаблонных фраз.
+6. Выведите только текст письма: без markdown, кавычек, темы письма и заглушек вида [Имя].`
         };
     }
-}
 
-// Замените функцию generateAICoverLetter на эту:
-async function generateAICoverLetter(jobTitle, companyName, vacancyDescription) {
-    const prompt = buildPrompt(jobTitle, companyName, vacancyDescription);
-    const provider = CONFIG.aiProvider;
-    const providerInfo = AI_PROVIDERS[provider];
-
-    addLog('info', 'System', 'AI', '-', `🤖 Провайдер: ${providerInfo.icon} ${providerInfo.name}`);
-    addLog('info', 'System', 'AI', '-', `📋 Модель: ${CONFIG[provider + 'Model']}`);
-    addLog('info', 'System', 'AI', '-', ` Промпт построен. Длина user части: ${prompt.user.length} симв.`);
-
-    // Показываем первые 300 символов промпта для отладки
-    const promptPreview = prompt.user.substring(0, 300);
-    addLog('info', 'System', 'AI', '-', `🔍 Начало промпта: "${promptPreview}..."`);
-
-    try {
-        let result = null;
-        if (provider === 'gemini') {
-            result = await generateWithGemini(prompt);
-        } else if (provider === 'claude') {
-            result = await generateWithClaude(prompt);
-        } else if (provider === 'qwen') {
-            result = await generateWithQwen(prompt);
-        } else {
-            throw new Error(`Неизвестный провайдер: ${provider}`);
-        }
-
-        if (result) {
-            addLog('info', 'System', 'AI', '-', `✅ Ответ получен: ${result.length} симв.`);
-            addLog('info', 'System', 'AI', '-', ` Начало ответа: "${result.substring(0, 200)}..."`);
-        } else {
-            addLog('info', 'System', 'AI', '-', '⚠️ Пустой ответ от ИИ');
-        }
-
-        return result;
-      } catch (e) {
-        console.error(`${provider} generation failed:`, e);
-        addLog('info', 'System', 'AI', '-', `❌ Ошибка ${providerInfo.name}: ${e.message}`);
-        return null;
-       }
+    function cleanAiText(text) {
+        return text.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').replace(/\*\*/g, '').trim();
     }
 
- 
-   function generateWithGemini(prompt) {
-    return new Promise((resolve, reject) => {
-        if (!CONFIG.geminiApiKey) {
-            reject(new Error("Gemini API Key не указан"));
-            return;
-        }
-
-        const modelsToTry = [
-            CONFIG.geminiModel,
-            'gemini-flash-latest',
-            'gemini-pro-latest'
-        ];
-
-        let currentModelIndex = 0;
-
-        function tryNextModel() {
-            if (currentModelIndex >= modelsToTry.length) {
-                reject(new Error("Все модели Gemini недоступны"));
-                return;
-            }
-
-            const model = modelsToTry[currentModelIndex];
-            addLog('info', 'System', 'Gemini', '-', `🔄 Пробую модель: ${model}`);
-
-            GM_xmlhttpRequest({
-                method: 'POST',
-                url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CONFIG.geminiApiKey}`,
-                headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt.system + "\n\n" + prompt.user }] }],
-                    generationConfig: {
-                        temperature: CONFIG.aiTemperature,
-                        maxOutputTokens: CONFIG.aiMaxTokens
-                    }
-                }),
-                onload: function(response) {
-                    if (response.status >= 200 && response.status < 300) {
-                        try {
-                            const data = JSON.parse(response.responseText);
-                            const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-                            if (!text) {
-                                throw new Error("Пустой ответ от Gemini");
-                            }
-
-                            if (model !== CONFIG.geminiModel) {
-                                addLog('info', 'System', 'Gemini', '-', `✅ Модель ${model} работает! Сохраняю.`);
-                                CONFIG.geminiModel = model;
-                                GM_setValue('autoApplyGeminiModel', model);
-                            }
-
-                            resolve(text.replace(/```[\s\S]*?```/g, '').replace(/`/g, '').trim());
-                        } catch (e) {
-                            addLog('info', 'System', 'Gemini', '-', `⚠️ Ошибка парсинга: ${e.message}`);
-                            currentModelIndex++;
-                            tryNextModel();
-                        }
-                    } else {
-                        addLog('info', 'System', 'Gemini', '-', `⚠️ Модель ${model} вернула ${response.status}`);
-                        currentModelIndex++;
-                        tryNextModel();
-                    }
-                },
-                onerror: function(error) {
-                    addLog('info', 'System', 'Gemini', '-', `⚠️ Сетевая ошибка для ${model}: ${error}`);
-                    currentModelIndex++;
-                    tryNextModel();
-                },
-                ontimeout: function() {
-                    addLog('info', 'System', 'Gemini', '-', `⚠️ Таймаут для ${model}`);
-                    currentModelIndex++;
-                    tryNextModel();
-                }
-            });
-        }
-
-        tryNextModel();
-    });
-}
-
-function generateWithClaude(prompt) {
-    return new Promise((resolve, reject) => {
-        if (!CONFIG.claudeApiKey) {
-            reject(new Error("Claude API Key не указан"));
-            return;
-        }
-
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: 'https://api.anthropic.com/v1/messages',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': CONFIG.claudeApiKey,
-                'anthropic-version': '2023-06-01',
-                'anthropic-dangerous-direct-browser-access': 'true'
-            },
-            data: JSON.stringify({
-                model: CONFIG.claudeModel,
-                max_tokens: CONFIG.aiMaxTokens,
-                temperature: CONFIG.aiTemperature,
-                system: prompt.system,
-                messages: [{ role: 'user', content: prompt.user }]
-            }),
-            onload: function(response) {
-                if (response.status >= 200 && response.status < 300) {
-                    try {
-                        const data = JSON.parse(response.responseText);
-                        const text = data?.content?.[0]?.text;
-                        if (!text) throw new Error("Пустой ответ от Claude");
-                        resolve(text.replace(/```[\s\S]*?```/g, '').replace(/`/g, '').trim());
-                    } catch (e) {
-                        reject(new Error(`Ошибка парсинга Claude: ${e.message}`));
-                    }
-                } else {
-                    reject(new Error(`Claude HTTP ${response.status}: ${response.responseText}`));
-                }
-            },
-            onerror: function(error) {
-                reject(new Error(`Claude сетевая ошибка: ${error}`));
-            },
-            ontimeout: function() {
-                reject(new Error("Claude таймаут"));
-            }
-        });
-    });
-}
- function generateWithQwen(prompt) {
-    return new Promise((resolve, reject) => {
-        if (!CONFIG.qwenApiKey) {
-            reject(new Error("Qwen API Key не указан"));
-            return;
-        }
-
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${CONFIG.qwenApiKey}`
-            },
-            data: JSON.stringify({
-                model: CONFIG.qwenModel,
-                messages: [
-                    { role: 'system', content: prompt.system },
-                    { role: 'user', content: prompt.user }
-                ],
-                temperature: CONFIG.aiTemperature,
-                max_tokens: CONFIG.aiMaxTokens
-            }),
-            onload: function(response) {
-                if (response.status >= 200 && response.status < 300) {
-                    try {
-                        const data = JSON.parse(response.responseText);
-                        const text = data?.choices?.[0]?.message?.content;
-                        if (!text) throw new Error("Пустой ответ от Qwen");
-                        resolve(text.replace(/```[\s\S]*?```/g, '').replace(/`/g, '').trim());
-                    } catch (e) {
-                        reject(new Error(`Ошибка парсинга Qwen: ${e.message}`));
-                    }
-                } else {
-                    reject(new Error(`Qwen HTTP ${response.status}: ${response.responseText}`));
-                }
-            },
-            onerror: function(error) {
-                reject(new Error(`Qwen сетевая ошибка: ${error}`));
-            },
-            ontimeout: function() {
-                reject(new Error("Qwen таймаут"));
-            }
-        });
-    });
-}
+    // Модели с «размышлениями» тратят часть лимита токенов на reasoning,
+    // поэтому лимит запроса берем с запасом, а длину письма задаем в промпте.
+    function requestTokenLimit() {
+        return Math.max(CONFIG.aiMaxTokens, 800) + 3000;
+    }
 
     async function generateAICoverLetter(jobTitle, companyName, vacancyDescription) {
         const prompt = buildPrompt(jobTitle, companyName, vacancyDescription);
         const provider = CONFIG.aiProvider;
         const providerInfo = AI_PROVIDERS[provider];
 
-        addLog('info', jobTitle, companyName, '-', ` ИИ: ${providerInfo.icon} ${providerInfo.name} (${CONFIG[provider + 'Model']})`);
+        addLog('info', jobTitle, companyName, '-', `🤖 ${providerInfo.icon} ${providerInfo.name} (${CONFIG[provider + 'Model']}), язык: ${prompt.lang}, описание: ${vacancyDescription ? vacancyDescription.length : 0} симв.`);
 
         try {
             let result = null;
@@ -574,12 +435,230 @@ function generateWithClaude(prompt) {
             } else {
                 throw new Error(`Неизвестный провайдер: ${provider}`);
             }
-            return result;
+
+            if (result && result.length >= 50) {
+                addLog('info', jobTitle, companyName, '-', `✅ Ответ ИИ: ${result.length} симв. «${result.substring(0, 120)}...»`);
+                return result;
+            }
+            addLog('info', jobTitle, companyName, '-', '⚠️ Пустой или слишком короткий ответ от ИИ');
+            return null;
         } catch (e) {
             console.error(`${provider} generation failed:`, e);
             addLog('info', 'System', 'AI', '-', `❌ Ошибка ${providerInfo.name}: ${e.message}`);
             return null;
         }
+    }
+
+    function generateWithGemini(prompt) {
+        return new Promise((resolve, reject) => {
+            if (!CONFIG.geminiApiKey) {
+                reject(new Error('Gemini API Key не указан'));
+                return;
+            }
+
+            const modelsToTry = [...new Set([CONFIG.geminiModel, 'gemini-flash-latest', 'gemini-flash-lite-latest'])];
+            let currentModelIndex = 0;
+            let lastError = '';
+
+            function tryNextModel() {
+                if (currentModelIndex >= modelsToTry.length) {
+                    reject(new Error(`Все модели Gemini недоступны (${lastError})`));
+                    return;
+                }
+                const model = modelsToTry[currentModelIndex++];
+
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': CONFIG.geminiApiKey },
+                    timeout: 90000,
+                    data: JSON.stringify({
+                        systemInstruction: { parts: [{ text: prompt.system }] },
+                        contents: [{ role: 'user', parts: [{ text: prompt.user }] }],
+                        generationConfig: {
+                            temperature: CONFIG.aiTemperature,
+                            maxOutputTokens: requestTokenLimit()
+                        }
+                    }),
+                    onload: function(response) {
+                        if (response.status < 200 || response.status >= 300) {
+                            lastError = `${model}: HTTP ${response.status} ${response.responseText.substring(0, 200)}`;
+                            addLog('info', 'System', 'Gemini', '-', `⚠️ ${lastError}`);
+                            // Неверный ключ — нет смысла перебирать модели
+                            if (response.status === 400 && /API key/i.test(response.responseText)) {
+                                reject(new Error('Неверный API ключ Gemini'));
+                                return;
+                            }
+                            tryNextModel();
+                            return;
+                        }
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            const candidate = data?.candidates?.[0];
+                            const text = (candidate?.content?.parts || [])
+                                .filter(p => p.text && !p.thought)
+                                .map(p => p.text).join('');
+                            if (!text) {
+                                throw new Error(`пустой ответ (finishReason: ${candidate?.finishReason || data?.promptFeedback?.blockReason || 'n/a'})`);
+                            }
+                            if (candidate.finishReason === 'MAX_TOKENS') {
+                                addLog('info', 'System', 'Gemini', '-', '⚠️ Ответ обрезан по лимиту токенов — увеличьте «Макс. длина»');
+                            }
+                            if (model !== CONFIG.geminiModel) {
+                                addLog('info', 'System', 'Gemini', '-', `✅ Модель ${model} работает, сохраняю.`);
+                                CONFIG.geminiModel = model;
+                                GM_setValue('autoApplyGeminiModel', model);
+                            }
+                            resolve(cleanAiText(text));
+                        } catch (e) {
+                            lastError = `${model}: ${e.message}`;
+                            addLog('info', 'System', 'Gemini', '-', `⚠️ ${lastError}`);
+                            tryNextModel();
+                        }
+                    },
+                    onerror: function() {
+                        lastError = `${model}: сетевая ошибка`;
+                        tryNextModel();
+                    },
+                    ontimeout: function() {
+                        lastError = `${model}: таймаут`;
+                        tryNextModel();
+                    }
+                });
+            }
+
+            tryNextModel();
+        });
+    }
+
+    function generateWithClaude(prompt) {
+        return new Promise((resolve, reject) => {
+            if (!CONFIG.claudeApiKey) {
+                reject(new Error('Claude API Key не указан'));
+                return;
+            }
+
+            const model = CONFIG.claudeModel;
+            const isHaiku = /haiku/.test(model);
+            const body = {
+                model: model,
+                max_tokens: requestTokenLimit(),
+                system: prompt.system,
+                messages: [{ role: 'user', content: prompt.user }]
+            };
+            const headers = {
+                'Content-Type': 'application/json',
+                'x-api-key': CONFIG.claudeApiKey,
+                'anthropic-version': '2023-06-01',
+                'anthropic-dangerous-direct-browser-access': 'true'
+            };
+            if (isHaiku) {
+                // Haiku 4.5 поддерживает temperature; у Sonnet/Opus 5.x параметр убран (400).
+                body.temperature = CONFIG.aiTemperature;
+            } else {
+                // Письмо — простая задача: минимум размышлений, быстрее и дешевле.
+                body.output_config = { effort: 'low' };
+                // При отказе модели запрос автоматически уйдет на запасную модель.
+                body.fallbacks = 'default';
+                headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+            }
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: 'https://api.anthropic.com/v1/messages',
+                headers: headers,
+                timeout: 120000,
+                data: JSON.stringify(body),
+                onload: function(response) {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`Claude HTTP ${response.status}: ${response.responseText.substring(0, 300)}`));
+                        return;
+                    }
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data.stop_reason === 'refusal') throw new Error('модель отказалась отвечать');
+                        const text = (data.content || [])
+                            .filter(block => block.type === 'text')
+                            .map(block => block.text).join('');
+                        if (!text) throw new Error(`пустой ответ (stop_reason: ${data.stop_reason})`);
+                        resolve(cleanAiText(text));
+                    } catch (e) {
+                        reject(new Error(`Ошибка ответа Claude: ${e.message}`));
+                    }
+                },
+                onerror: function() { reject(new Error('Claude: сетевая ошибка')); },
+                ontimeout: function() { reject(new Error('Claude: таймаут')); }
+            });
+        });
+    }
+
+    function generateWithQwen(prompt) {
+        return new Promise((resolve, reject) => {
+            if (!CONFIG.qwenApiKey) {
+                reject(new Error('Qwen API Key не указан'));
+                return;
+            }
+
+            // Ключи из международной консоли Alibaba Cloud работают только с dashscope-intl.
+            const endpoints = [
+                'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions',
+                'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
+            ];
+            const saved = GM_getValue('autoApplyQwenEndpoint', '');
+            if (saved && endpoints.includes(saved)) endpoints.sort((a, b) => (a === saved ? -1 : b === saved ? 1 : 0));
+            let index = 0;
+            let lastError = '';
+
+            function tryEndpoint() {
+                if (index >= endpoints.length) {
+                    reject(new Error(lastError || 'Qwen недоступен'));
+                    return;
+                }
+                const url = endpoints[index++];
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: url,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${CONFIG.qwenApiKey}`
+                    },
+                    timeout: 90000,
+                    data: JSON.stringify({
+                        model: CONFIG.qwenModel,
+                        messages: [
+                            { role: 'system', content: prompt.system },
+                            { role: 'user', content: prompt.user }
+                        ],
+                        temperature: CONFIG.aiTemperature,
+                        max_tokens: requestTokenLimit()
+                    }),
+                    onload: function(response) {
+                        if (response.status === 401 || response.status === 403) {
+                            lastError = `Qwen HTTP ${response.status}: ${response.responseText.substring(0, 200)}`;
+                            tryEndpoint();
+                            return;
+                        }
+                        if (response.status < 200 || response.status >= 300) {
+                            reject(new Error(`Qwen HTTP ${response.status}: ${response.responseText.substring(0, 300)}`));
+                            return;
+                        }
+                        try {
+                            const data = JSON.parse(response.responseText);
+                            const text = data?.choices?.[0]?.message?.content;
+                            if (!text) throw new Error('пустой ответ');
+                            GM_setValue('autoApplyQwenEndpoint', url);
+                            resolve(cleanAiText(text));
+                        } catch (e) {
+                            reject(new Error(`Ошибка ответа Qwen: ${e.message}`));
+                        }
+                    },
+                    onerror: function() { lastError = 'Qwen: сетевая ошибка'; tryEndpoint(); },
+                    ontimeout: function() { lastError = 'Qwen: таймаут'; tryEndpoint(); }
+                });
+            }
+
+            tryEndpoint();
+        });
     }
 
     let settingsModal = null;
@@ -643,7 +722,7 @@ function generateWithClaude(prompt) {
                     </div>
                     <div style="margin-bottom: 10px;">
                         <label style="display: block; color: #d1d5db; font-size: 12px; margin-bottom: 4px;">API Key:</label>
-                        <input type="password" id="hh-${key}-api-key" value="${CONFIG[key + 'ApiKey']}"
+                        <input type="password" id="hh-${key}-api-key" value="${escapeHtml(CONFIG[key + 'ApiKey'])}"
                             style="width: 100%; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 4px; padding: 6px 10px; font-family: monospace; font-size: 12px; box-sizing: border-box;"
                             placeholder="Введите ${info.name} API ключ..." />
                     </div>
@@ -660,7 +739,7 @@ function generateWithClaude(prompt) {
         settingsModal.innerHTML = `
             <div style="background: #1f2937; border-radius: 12px; width: 720px; max-height: 90vh; overflow-y: auto; border: 1px solid #374151; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);">
                 <div style="padding: 20px; border-bottom: 1px solid #374151; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: #1f2937; z-index: 10;">
-                    <h2 style="margin: 0; color: #f3f4f6; font-size: 20px;">⚙️ Настройки Auto-Apply v5.2 (Multi-AI)</h2>
+                    <h2 style="margin: 0; color: #f3f4f6; font-size: 20px;">⚙️ Настройки Auto-Apply v${SCRIPT_VERSION} (Multi-AI)</h2>
                     <button id="hh-close-settings" style="background: transparent; border: none; color: #9ca3af; font-size: 24px; cursor: pointer; padding: 0; width: 32px; height: 32px;">&times;</button>
                 </div>
 
@@ -699,13 +778,13 @@ function generateWithClaude(prompt) {
                     <div style="background: #111827; padding: 16px; border-radius: 8px; border: 1px solid #374151;">
                         <label style="display: block; color: #60a5fa; font-weight: 600; margin-bottom: 8px; font-size: 14px;">👤 Ваш профессиональный профиль (для ИИ)</label>
                         <p style="color: #9ca3af; font-size: 12px; margin-bottom: 8px;">Это описание будет использоваться ИИ для генерации сопроводительных писем.</p>
-                        <textarea id="hh-user-profile" style="width: 100%; min-height: 150px; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 6px; padding: 12px; font-family: inherit; font-size: 13px; resize: vertical; box-sizing: border-box;">${USER_PROFILE}</textarea>
+                        <textarea id="hh-user-profile" style="width: 100%; min-height: 150px; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 6px; padding: 12px; font-family: inherit; font-size: 13px; resize: vertical; box-sizing: border-box;">${escapeHtml(USER_PROFILE)}</textarea>
                     </div>
 
                     <div style="background: #111827; padding: 16px; border-radius: 8px; border: 1px solid #374151;">
                         <label style="display: block; color: #34d399; font-weight: 600; margin-bottom: 8px; font-size: 14px;">📝 Шаблон сопроводительного письма (резервный)</label>
                         <p style="color: #9ca3af; font-size: 12px; margin-bottom: 8px;">Используется когда ИИ недоступен. Плейсхолдеры: {vacancy_title}, {company_name}</p>
-                        <textarea id="hh-cover-letter-template" style="width: 100%; min-height: 120px; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 6px; padding: 12px; font-family: inherit; font-size: 13px; resize: vertical; box-sizing: border-box;">${CONFIG.coverLetterTemplate}</textarea>
+                        <textarea id="hh-cover-letter-template" style="width: 100%; min-height: 120px; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 6px; padding: 12px; font-family: inherit; font-size: 13px; resize: vertical; box-sizing: border-box;">${escapeHtml(CONFIG.coverLetterTemplate)}</textarea>
                     </div>
 
                     <div style="background: #111827; padding: 16px; border-radius: 8px; border: 1px solid #374151;">
@@ -722,8 +801,8 @@ function generateWithClaude(prompt) {
                                 <label style="display: block; color: #d1d5db; font-size: 13px; margin-bottom: 6px;">
                                     Макс. длина (tokens): <span id="hh-tokens-value" style="color: #60a5fa;">${CONFIG.aiMaxTokens}</span>
                                 </label>
-                                <input type="range" id="hh-ai-tokens" min="200" max="1000" step="50" value="${CONFIG.aiMaxTokens}" style="width: 100%;" />
-                                <p style="color: #6b7280; font-size: 11px; margin-top: 4px;">Рекомендуется: 400-600</p>
+                                <input type="range" id="hh-ai-tokens" min="400" max="2000" step="100" value="${CONFIG.aiMaxTokens}" style="width: 100%;" />
+                                <p style="color: #6b7280; font-size: 11px; margin-top: 4px;">Рекомендуется: 800-1200 (русский текст «дороже» в токенах)</p>
                             </div>
                         </div>
                     </div>
@@ -846,8 +925,8 @@ function generateWithClaude(prompt) {
                 document.getElementById('hh-cover-letter-template').value = "Здравствуйте!\n\nМеня очень заинтересовала ваша вакансия \"{vacancy_title}\" в компании \"{company_name}\".\n\nЯ — сертифицированный руководитель проектов (PMP) с более чем 10-летним опытом управления IT-программами в крупнейших международных корпорациях (Alcoa, Nestle, Северсталь Тех Лаб). Имею опыт внедрения Industrial AI, управления портфелем из 30+ проектов и повышения velocity команды на 20%.\n\nОбладаю паспортом ЕС, свободным английским и полностью готов к релокации.\n\nБуду рад обсудить подробности на собеседовании!\n\nС уважением,\nКандидат";
                 document.getElementById('hh-ai-temperature').value = 0.7;
                 document.getElementById('hh-temp-value').textContent = '0.7';
-                document.getElementById('hh-ai-tokens').value = 500;
-                document.getElementById('hh-tokens-value').textContent = '500';
+                document.getElementById('hh-ai-tokens').value = 1000;
+                document.getElementById('hh-tokens-value').textContent = '1000';
                 RESUME_LIST = [...DEFAULT_RESUMES];
                 saveResumeList();
                 renderResumeListInSettings();
@@ -882,7 +961,7 @@ function generateWithClaude(prompt) {
             <div style="background: #1f2937; padding: 12px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #374151; cursor: move;" id="hh-panel-header">
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <span style="background: #ef4444; width: 8px; height: 8px; border-radius: 50%; display: inline-block;" id="hh-status-indicator"></span>
-                    <strong style="font-size: 14px;">HH Auto-Apply v5.2</strong>
+                    <strong style="font-size: 14px;">HH Auto-Apply v${SCRIPT_VERSION}</strong>
                 </div>
                 <div style="display: flex; gap: 6px;">
                     <button id="hh-btn-settings" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">⚙️ Настройки</button>
@@ -902,7 +981,7 @@ function generateWithClaude(prompt) {
                     <div style="font-weight: 600; margin-bottom: 6px; color: #818cf8;">⚙️ Текущие настройки:</div>
                     <div style="display: flex; flex-direction: column; gap: 4px; color: #d1d5db;">
                         <div>🤖 <strong>ИИ:</strong> <span style="color: #fbbf24;" id="hh-active-ai-display">${currentProvider.icon} ${currentProvider.name} (${currentModel})</span></div>
-                        <div>📄 <strong>Резюме:</strong> <span style="color: #60a5fa;" id="hh-active-resume-text">${CONFIG.selectedResumeTitle}</span></div>
+                        <div>📄 <strong>Резюме:</strong> <span style="color: #60a5fa;" id="hh-active-resume-text">${escapeHtml(CONFIG.selectedResumeTitle)}</span></div>
                         <div>✉️ <strong>Письмо:</strong> <span style="color: #34d399;" id="hh-active-mode-text">${CONFIG.coverLetterMode === 'ai' ? 'Умный ИИ' : 'Статический шаблон'}</span></div>
                         <div>🎯 <strong>Лимит:</strong> ${CONFIG.applyLimit} откликов</div>
                     </div>
@@ -1019,7 +1098,7 @@ function generateWithClaude(prompt) {
         state.active = !state.active;
         saveState();
         if (state.active) {
-            addLog('info', 'System', 'Engine', '-', `Smart Auto-Apply v5.2 started (ИИ: ${AI_PROVIDERS[CONFIG.aiProvider].name})`);
+            addLog('info', 'System', 'Engine', '-', `Smart Auto-Apply v${SCRIPT_VERSION} started (ИИ: ${AI_PROVIDERS[CONFIG.aiProvider].name})`);
             runScannerLifecycle();
         } else {
             addLog('info', 'System', 'Engine', '-', 'Auto-Apply paused');
@@ -1074,7 +1153,7 @@ function generateWithClaude(prompt) {
                 if (log.status === 'applied') color = '#10b981';
                 if (log.status === 'skipped') color = '#f87171';
                 if (log.status === 'matched') color = '#60a5fa';
-                return `<div style="margin-bottom: 4px; color: ${color};">[${log.timestamp}] ${log.status.toUpperCase()}: ${log.title} - ${log.reason || 'processed'}</div>`;
+                return `<div style="margin-bottom: 4px; color: ${color};">[${escapeHtml(log.timestamp)}] ${escapeHtml(log.status.toUpperCase())}: ${escapeHtml(log.title)} - ${escapeHtml(log.reason || 'processed')}</div>`;
             }).join('') || '<div style="color: #6b7280; text-align: center; margin-top: 20px;">Нет записей</div>';
         }
     }
@@ -1154,25 +1233,21 @@ function generateWithClaude(prompt) {
 
                 if (!state.active) return;
 
-                const vacancyLink = card.querySelector('a[data-qa="serp-item__title"], a.bloko-link');
+                // Раньше брался первый a.bloko-link, которым часто оказывалась ссылка на работодателя,
+                // и ИИ получал описание компании вместо вакансии (или ничего).
+                const vacancyLink = card.querySelector('a[data-qa="serp-item__title"]') ||
+                    Array.from(card.querySelectorAll('a[href*="/vacancy/"]')).find(a => getVacancyId(a.href));
                 const vacancyUrl = vacancyLink ? vacancyLink.href : null;
-                let description = "";
 
-                if (vacancyUrl && CONFIG.coverLetterMode === 'ai') {
-                    addLog('info', title, company, '-', '📥 Загрузка описания вакансии...');
-                    description = await fetchVacancyDescription(vacancyUrl);
-                    if (description) {
-                        const lang = detectLanguage(description + " " + title);
-                        addLog('info', title, company, '-', `🌍 Язык: ${lang === 'en' ? 'English' : 'Русский'} | 📋 ${description.length} симв.`);
-                    } else {
-                        addLog('info', title, company, '-', '⚠️ Не удалось загрузить описание');
-                    }
-                }
+                // Письмо готовим ДО открытия формы: генерация может занять десятки секунд
+                // и не должна съедать таймаут модального окна.
+                const coverLetter = await prepareCoverLetter(title, company, vacancyUrl);
+                if (!state.active) return;
 
                 applyBtn.click();
                 addLog('info', title, company, salary, 'Открытие формы отклика...');
 
-                await handleResponseModalLifecycle(title, company, description);
+                await handleResponseModalLifecycle(title, company, coverLetter);
                 await new Promise(resolve => setTimeout(resolve, 2000));
             } else {
                 addLog('skipped', title, company, salary, 'Кнопка отклика не найдена');
@@ -1182,7 +1257,31 @@ function generateWithClaude(prompt) {
         addLog('info', 'Page Scan', 'Engine', '-', 'Страница обработана.');
     }
 
-    async function handleResponseModalLifecycle(jobTitle, companyName, vacancyDescription) {
+    async function prepareCoverLetter(jobTitle, companyName, vacancyUrl) {
+        if (CONFIG.coverLetterMode !== 'ai') return fillTemplate(jobTitle, companyName);
+
+        const currentApiKey = CONFIG[CONFIG.aiProvider + 'ApiKey'];
+        if (!currentApiKey) {
+            addLog('info', jobTitle, companyName, '-', `⚠️ API ключ ${AI_PROVIDERS[CONFIG.aiProvider].name} не указан. Использую шаблон.`);
+            return fillTemplate(jobTitle, companyName);
+        }
+
+        addLog('info', jobTitle, companyName, '-', '📥 Загрузка описания вакансии...');
+        const description = await fetchVacancyDescription(vacancyUrl);
+        if (!description) {
+            addLog('info', jobTitle, companyName, '-', '⚠️ Описание не получено — письмо будет только по названию вакансии');
+        }
+
+        const aiLetter = await generateAICoverLetter(jobTitle, companyName, description);
+        if (aiLetter) {
+            addLog('info', jobTitle, companyName, '-', '✅ Письмо под вакансию сгенерировано');
+            return aiLetter;
+        }
+        addLog('info', jobTitle, companyName, '-', '⚠️ Ошибка ИИ. Использую шаблон.');
+        return fillTemplate(jobTitle, companyName);
+    }
+
+    async function handleResponseModalLifecycle(jobTitle, companyName, preparedLetter) {
         const MODAL_TIMEOUT = 60000;
         const startTime = Date.now();
 
@@ -1195,6 +1294,8 @@ function generateWithClaude(prompt) {
             let hasWrittenLetter = false;
             let hasSubmitted = false;
             let isProcessingTick = false;
+            let letterWriteAttempts = 0;
+            let ticksWithoutModal = 0;
             let timeoutWarningShown = false;
 
             function findActiveModal() {
@@ -1220,6 +1321,10 @@ function generateWithClaude(prompt) {
                 }
                 if (document.querySelector('[data-qa="relocation-warning-confirm"], [data-qa="vacancy-response-submit-button"]')) return document.body;
                 return null;
+            }
+
+            function findLetterTextarea(modal) {
+                return modal.querySelector('textarea[data-qa*="letter"], textarea[name*="letter"], textarea.bloko-textarea, .vacancy-response-letter-input textarea') || modal.querySelector('textarea');
             }
 
             function alertUser(message) {
@@ -1271,6 +1376,7 @@ function generateWithClaude(prompt) {
 
                     if (modal) {
                         attempt = 0;
+                        ticksWithoutModal = 0;
                         const modalTextLower = (modal.textContent || "").toLowerCase();
 
                         const isRelocationModal = !hasConfirmedRegion && (modalTextLower.includes("откликаетесь на вакансию в другой стране") || modalTextLower.includes("откликаетесь на вакансию в другом регионе") || modalTextLower.includes("все равно откликнуться") || !!modal.querySelector('[data-qa="relocation-warning-confirm"]'));
@@ -1333,7 +1439,7 @@ function generateWithClaude(prompt) {
                                         if (hdr) {
                                             hdr.style.background = '#1f2937';
                                             const headerTitle = hdr.querySelector('strong');
-                                            if (headerTitle) headerTitle.textContent = 'HH Auto-Apply v5.2';
+                                            if (headerTitle) headerTitle.textContent = `HH Auto-Apply v${SCRIPT_VERSION}`;
                                         }
                                         addLog('info', jobTitle, companyName, '-', 'Продолжаю сканирование...');
                                         resolve(true);
@@ -1407,7 +1513,7 @@ function generateWithClaude(prompt) {
                         }
 
                         if (hasClickedCoverLetterButton && !hasToggledLetter) {
-                            const textarea = modal.querySelector('[data-qa="vacancy-response-letter-input"], textarea.bloko-textarea, .vacancy-response-letter-input') || modal.querySelector('textarea');
+                            const textarea = findLetterTextarea(modal);
                             if (textarea) {
                                 hasToggledLetter = true;
                                 addLog('info', jobTitle, companyName, '-', '✅ Поле письма найдено');
@@ -1417,28 +1523,10 @@ function generateWithClaude(prompt) {
                         }
 
                         if (hasToggledLetter && !hasWrittenLetter) {
-                            let textarea = modal.querySelector('[data-qa="vacancy-response-letter-input"], textarea.bloko-textarea, .vacancy-response-letter-input') || modal.querySelector('textarea');
+                            let textarea = findLetterTextarea(modal);
                             if (textarea) {
-                                let compiledLetter = "";
-                                if (CONFIG.coverLetterMode === 'ai') {
-                                    const currentApiKey = CONFIG[CONFIG.aiProvider + 'ApiKey'];
-                                    if (currentApiKey) {
-                                        addLog('info', jobTitle, companyName, '-', `🤖 Генерация через ${AI_PROVIDERS[CONFIG.aiProvider].name}...`);
-                                        const aiLetter = await generateAICoverLetter(jobTitle, companyName, vacancyDescription);
-                                        if (aiLetter) {
-                                            compiledLetter = aiLetter;
-                                            addLog('info', jobTitle, companyName, '-', '✅ Письмо сгенерировано!');
-                                        } else {
-                                            addLog('info', jobTitle, companyName, '-', '⚠️ Ошибка ИИ. Использую шаблон.');
-                                            compiledLetter = CONFIG.coverLetterTemplate.replace(/{vacancy_title}/g, jobTitle).replace(/{company_name}/g, companyName);
-                                        }
-                                    } else {
-                                        addLog('info', jobTitle, companyName, '-', `⚠️ API ключ ${AI_PROVIDERS[CONFIG.aiProvider].name} не указан. Использую шаблон.`);
-                                        compiledLetter = CONFIG.coverLetterTemplate.replace(/{vacancy_title}/g, jobTitle).replace(/{company_name}/g, companyName);
-                                    }
-                                } else {
-                                    compiledLetter = CONFIG.coverLetterTemplate.replace(/{vacancy_title}/g, jobTitle).replace(/{company_name}/g, companyName);
-                                }
+                                const compiledLetter = preparedLetter || fillTemplate(jobTitle, companyName);
+                                letterWriteAttempts++;
 
                                 try {
                                     textarea.focus();
@@ -1460,8 +1548,8 @@ function generateWithClaude(prompt) {
                         }
 
                         if (hasWrittenLetter && !hasSubmitted) {
-                            const textarea = modal.querySelector('[data-qa="vacancy-response-letter-input"], textarea.bloko-textarea, .vacancy-response-letter-input') || modal.querySelector('textarea');
-                            if (textarea && textarea.value.length < 10) {
+                            const textarea = findLetterTextarea(modal);
+                            if (textarea && textarea.value.length < 10 && letterWriteAttempts < 3) {
                                 addLog('info', jobTitle, companyName, '-', '️ Письмо не вставлено, пробую еще раз...');
                                 hasWrittenLetter = false;
                                 return;
@@ -1485,7 +1573,9 @@ function generateWithClaude(prompt) {
                             }
                         }
                     } else {
-                        if (hasSubmitted || hasConfirmedRegion) {
+                        ticksWithoutModal++;
+                        // После подтверждения региона форма появляется с задержкой — ждем ~3с, прежде чем считать отклик отправленным
+                        if (hasSubmitted || (hasConfirmedRegion && ticksWithoutModal > 6)) {
                             clearInterval(checkInterval);
                             addLog('applied', jobTitle, companyName, '-', '✅ Отклик отправлен!');
                             state.applied++; saveState();
@@ -1526,5 +1616,12 @@ function generateWithClaude(prompt) {
         Notification.requestPermission();
     }
 
-    setTimeout(initUI, 1000);
+    setTimeout(() => {
+        initUI();
+        // Состояние «активен» сохраняется между страницами — продолжаем работу после перехода/перезагрузки
+        if (state.active) {
+            addLog('info', 'System', 'Engine', '-', 'Продолжаю автоотклик на новой странице...');
+            runScannerLifecycle();
+        }
+    }, 1500);
 })();
