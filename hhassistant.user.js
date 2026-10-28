@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.4)
+// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.5)
 // @namespace    http://tampermonkey.net/
-// @version      5.4
+// @version      5.5
 // @description  Умный автоотклик на hh.ru с поддержкой Gemini, Claude и Qwen.
 // @author       HH Auto-Apply Builder
 // @match        https://*.hh.ru/search/*
@@ -72,7 +72,8 @@
 };
 
     const CONFIG = {
-        applyLimit: 30,
+        // Дневной лимит откликов: меняется прямо на панели, по умолчанию 30
+        applyLimit: GM_getValue('autoApplyDailyLimit', 30),
         delayMinMs: 3000,
         delayMaxMs: 7000,
         coverLetterMode: GM_getValue('autoApplyCoverLetterMode', "ai"),
@@ -100,14 +101,53 @@
         scanned: GM_getValue('autoApplyScanned', 0),
         applied: GM_getValue('autoApplyApplied', 0),
         skipped: GM_getValue('autoApplySkipped', 0),
+        // Счетчик откликов за текущий день (для дневного лимита)
+        todayApplied: GM_getValue('autoApplyTodayApplied', 0),
+        todayDate: GM_getValue('autoApplyTodayDate', ''),
         logs: JSON.parse(GM_getValue('autoApplyLogs', '[]'))
     };
+
+    function todayKey() {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    // В новый день счетчик дневного лимита обнуляется автоматически
+    function ensureToday() {
+        const today = todayKey();
+        if (state.todayDate !== today) {
+            state.todayDate = today;
+            state.todayApplied = 0;
+            GM_setValue('autoApplyTodayDate', today);
+            GM_setValue('autoApplyTodayApplied', 0);
+        }
+    }
+
+    function isDailyLimitReached() {
+        ensureToday();
+        return state.todayApplied >= CONFIG.applyLimit;
+    }
+
+    function stopOnDailyLimit() {
+        addLog('info', 'System', 'Engine', '-', `🎯 Дневной лимит достигнут (${state.todayApplied}/${CONFIG.applyLimit}). Остановка. Сбросить счетчик можно кнопкой «↺» на панели.`);
+        state.active = false;
+        saveState();
+    }
+
+    function resetDailyCounter() {
+        state.todayDate = todayKey();
+        state.todayApplied = 0;
+        saveState();
+        addLog('info', 'System', 'Engine', '-', '↺ Счетчик дневного лимита сброшен');
+    }
 
     function saveState() {
         GM_setValue('autoApplyActive', state.active);
         GM_setValue('autoApplyScanned', state.scanned);
         GM_setValue('autoApplyApplied', state.applied);
         GM_setValue('autoApplySkipped', state.skipped);
+        GM_setValue('autoApplyTodayApplied', state.todayApplied);
+        GM_setValue('autoApplyTodayDate', state.todayDate);
         GM_setValue('autoApplyLogs', JSON.stringify(state.logs));
         updatePanelUI();
     }
@@ -202,7 +242,7 @@
         });
     }
 
-    const SCRIPT_VERSION = '5.4';
+    const SCRIPT_VERSION = '5.5';
 
     function escapeHtml(value) {
         return String(value == null ? '' : value)
@@ -947,30 +987,31 @@ ${USER_PROFILE}
         panelElement = document.createElement('div');
         panelElement.id = 'hh-auto-apply-panel';
         panelElement.style.cssText = `
-            position: fixed; bottom: 20px; right: 20px; width: 380px; max-height: 720px;
-            overflow-y: auto; background: #111827; color: #f3f4f6; border-radius: 12px;
+            position: fixed; bottom: 20px; right: 20px; width: 380px; max-height: min(720px, calc(100vh - 20px));
+            background: #111827; color: #f3f4f6; border-radius: 12px;
             box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); font-family: system-ui, -apple-system, sans-serif;
             font-size: 13px; z-index: 99999; border: 1px solid #374151; display: flex;
-            flex-direction: column; overflow: hidden; transition: all 0.3s ease;
+            flex-direction: column; overflow: hidden;
         `;
 
         const currentProvider = AI_PROVIDERS[CONFIG.aiProvider];
         const currentModel = CONFIG[CONFIG.aiProvider + 'Model'];
 
         panelElement.innerHTML = `
-            <div style="background: #1f2937; padding: 12px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #374151; cursor: move;" id="hh-panel-header">
+            <div style="background: #1f2937; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #374151; cursor: move; user-select: none; touch-action: none;" id="hh-panel-header" title="Перетащите, чтобы переместить. Двойной клик — вернуть в угол">
                 <div style="display: flex; align-items: center; gap: 8px;">
                     <span style="background: #ef4444; width: 8px; height: 8px; border-radius: 50%; display: inline-block;" id="hh-status-indicator"></span>
                     <strong style="font-size: 14px;">HH Auto-Apply v${SCRIPT_VERSION}</strong>
                 </div>
                 <div style="display: flex; gap: 6px;">
                     <button id="hh-btn-settings" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">⚙️ Настройки</button>
-                    <button id="hh-toggle-minimize" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">_</button>
-                    <button id="hh-btn-reset" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">Сброс</button>
+                    <button id="hh-btn-dock" title="Переместить к другому краю экрана" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">⇄</button>
+                    <button id="hh-toggle-minimize" title="Свернуть / развернуть" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">_</button>
+                    <button id="hh-btn-reset" title="Очистить статистику и лог (дневной лимит не трогает)" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">🗑</button>
                 </div>
             </div>
 
-            <div style="padding: 12px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; flex: 1;" id="hh-panel-body">
+            <div style="padding: 12px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; flex: 1; min-height: 0;" id="hh-panel-body">
                 <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; background: #1f2937; padding: 10px; border-radius: 8px;">
                     <div><div style="color: #9ca3af; font-size: 10px; text-transform: uppercase;">Scanned</div><strong id="hh-stat-scanned" style="font-size: 16px; color: #60a5fa;">0</strong></div>
                     <div><div style="color: #9ca3af; font-size: 10px; text-transform: uppercase;">Applied</div><strong id="hh-stat-applied" style="font-size: 16px; color: #10b981;">0</strong></div>
@@ -983,8 +1024,22 @@ ${USER_PROFILE}
                         <div>🤖 <strong>ИИ:</strong> <span style="color: #fbbf24;" id="hh-active-ai-display">${currentProvider.icon} ${currentProvider.name} (${currentModel})</span></div>
                         <div>📄 <strong>Резюме:</strong> <span style="color: #60a5fa;" id="hh-active-resume-text">${escapeHtml(CONFIG.selectedResumeTitle)}</span></div>
                         <div>✉️ <strong>Письмо:</strong> <span style="color: #34d399;" id="hh-active-mode-text">${CONFIG.coverLetterMode === 'ai' ? 'Умный ИИ' : 'Статический шаблон'}</span></div>
-                        <div>🎯 <strong>Лимит:</strong> ${CONFIG.applyLimit} откликов</div>
                     </div>
+                </div>
+
+                <div style="background: #1f2937; padding: 10px; border-radius: 8px; font-size: 11px; display: flex; flex-direction: column; gap: 6px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                        <label for="hh-input-limit" style="font-weight: 600; color: #f472b6;">🎯 Дневной лимит откликов:</label>
+                        <input type="number" id="hh-input-limit" min="1" max="500" value="${CONFIG.applyLimit}" style="width: 64px; background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 4px; padding: 3px 6px; font-size: 12px;" />
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="flex: 1; height: 6px; background: #374151; border-radius: 3px; overflow: hidden;">
+                            <div id="hh-limit-bar" style="height: 100%; width: 0%; background: #10b981;"></div>
+                        </div>
+                        <span style="color: #d1d5db; white-space: nowrap;">Сегодня: <strong id="hh-limit-today">0</strong> / <span id="hh-limit-max">${CONFIG.applyLimit}</span></span>
+                        <button id="hh-btn-reset-limit" title="Сбросить счетчик за сегодня" style="background: #374151; border: 1px solid #4b5563; color: white; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">↺ Сбросить</button>
+                    </div>
+                    <span style="color: #6b7280; font-size: 10px;">Счетчик обнуляется автоматически каждый день или вручную кнопкой «Сбросить».</span>
                 </div>
 
                 <div style="background: #1f2937; padding: 10px; border-radius: 8px; font-size: 11px; display: flex; flex-direction: column; gap: 4px;">
@@ -1047,6 +1102,24 @@ ${USER_PROFILE}
         document.getElementById('hh-btn-reset').addEventListener('click', resetScriptStats);
         document.getElementById('hh-btn-export').addEventListener('click', exportLogsToCSV);
         document.getElementById('hh-toggle-minimize').addEventListener('click', toggleMinimize);
+        document.getElementById('hh-btn-dock').addEventListener('click', dockToOtherSide);
+
+        document.getElementById('hh-input-limit').addEventListener('change', (e) => {
+            const value = parseInt(e.target.value, 10);
+            if (!Number.isFinite(value) || value < 1) {
+                e.target.value = CONFIG.applyLimit;
+                return;
+            }
+            CONFIG.applyLimit = Math.min(value, 500);
+            e.target.value = CONFIG.applyLimit;
+            GM_setValue('autoApplyDailyLimit', CONFIG.applyLimit);
+            updatePanelUI();
+            addLog('info', 'System', 'Engine', '-', `🎯 Дневной лимит: ${CONFIG.applyLimit}`);
+        });
+
+        document.getElementById('hh-btn-reset-limit').addEventListener('click', () => {
+            if (confirm(`Сбросить счетчик откликов за сегодня (${state.todayApplied})?`)) resetDailyCounter();
+        });
         document.getElementById('hh-btn-settings').addEventListener('click', openSettingsModal);
 
         document.getElementById('hh-select-resume').addEventListener('change', (e) => {
@@ -1080,7 +1153,15 @@ ${USER_PROFILE}
             GM_setValue('autoApplyAutoConfirmRegion', e.target.checked);
         });
 
-        dragElement(panelElement, document.getElementById('hh-panel-header'));
+        const header = document.getElementById('hh-panel-header');
+        makePanelDraggable(panelElement, header);
+        header.addEventListener('dblclick', (e) => {
+            if (e.target.closest('button')) return;
+            resetPanelPosition();
+        });
+        restorePanelPosition();
+        if (GM_getValue('autoApplyPanelMinimized', false)) toggleMinimize();
+        window.addEventListener('resize', () => clampPanelIntoView(true));
         updatePanelUI();
     }
 
@@ -1091,7 +1172,104 @@ ${USER_PROFILE}
         isMinimized = !isMinimized;
         body.style.display = isMinimized ? 'none' : 'flex';
         toggleBtn.textContent = isMinimized ? '▢' : '_';
-        panelElement.style.maxHeight = isMinimized ? '40px' : '720px';
+        GM_setValue('autoApplyPanelMinimized', isMinimized);
+        clampPanelIntoView(true);
+    }
+
+    // --- Положение панели: перетаскивание, прилипание к краям, запоминание ---
+
+    function setPanelPosition(left, top) {
+        const maxLeft = Math.max(0, window.innerWidth - panelElement.offsetWidth);
+        const maxTop = Math.max(0, window.innerHeight - panelElement.offsetHeight);
+        left = Math.min(Math.max(0, left), maxLeft);
+        top = Math.min(Math.max(0, top), maxTop);
+        panelElement.style.left = left + 'px';
+        panelElement.style.top = top + 'px';
+        panelElement.style.right = 'auto';
+        panelElement.style.bottom = 'auto';
+        return { left, top };
+    }
+
+    function savePanelPosition() {
+        const rect = panelElement.getBoundingClientRect();
+        GM_setValue('autoApplyPanelPos', JSON.stringify({ left: Math.round(rect.left), top: Math.round(rect.top) }));
+    }
+
+    function restorePanelPosition() {
+        try {
+            const pos = JSON.parse(GM_getValue('autoApplyPanelPos', 'null'));
+            if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) setPanelPosition(pos.left, pos.top);
+        } catch (e) { /* позиция по умолчанию */ }
+    }
+
+    function resetPanelPosition() {
+        panelElement.style.left = 'auto';
+        panelElement.style.top = 'auto';
+        panelElement.style.right = '20px';
+        panelElement.style.bottom = '20px';
+        GM_setValue('autoApplyPanelPos', 'null');
+    }
+
+    // Если панель вылезла за экран (сворачивание, смена размера окна) — возвращаем ее в видимую область
+    function clampPanelIntoView(persist) {
+        if (!panelElement || panelElement.style.left === '' || panelElement.style.left === 'auto') return;
+        const rect = panelElement.getBoundingClientRect();
+        setPanelPosition(rect.left, rect.top);
+        if (persist) savePanelPosition();
+    }
+
+    function dockToOtherSide() {
+        const rect = panelElement.getBoundingClientRect();
+        const margin = 20;
+        const isOnRight = rect.left + rect.width / 2 > window.innerWidth / 2;
+        const left = isOnRight ? margin : window.innerWidth - rect.width - margin;
+        setPanelPosition(left, rect.top);
+        savePanelPosition();
+    }
+
+    function makePanelDraggable(panel, handle) {
+        let dragging = false;
+        let offsetX = 0, offsetY = 0;
+        let pendingX = 0, pendingY = 0, frame = 0;
+        const SNAP = 24; // прилипание к краю экрана, px
+
+        handle.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || e.target.closest('button, select, input, textarea')) return;
+            const rect = panel.getBoundingClientRect();
+            offsetX = e.clientX - rect.left;
+            offsetY = e.clientY - rect.top;
+            dragging = true;
+            handle.setPointerCapture(e.pointerId);
+            panel.style.opacity = '0.92';
+            e.preventDefault();
+        });
+
+        handle.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            pendingX = e.clientX - offsetX;
+            pendingY = e.clientY - offsetY;
+            if (frame) return;
+            frame = requestAnimationFrame(() => {
+                frame = 0;
+                const w = panel.offsetWidth, h = panel.offsetHeight;
+                let x = pendingX, y = pendingY;
+                if (x < SNAP) x = 0;
+                if (y < SNAP) y = 0;
+                if (window.innerWidth - (x + w) < SNAP) x = window.innerWidth - w;
+                if (window.innerHeight - (y + h) < SNAP) y = window.innerHeight - h;
+                setPanelPosition(x, y);
+            });
+        });
+
+        const endDrag = (e) => {
+            if (!dragging) return;
+            dragging = false;
+            if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+            panel.style.opacity = '';
+            savePanelPosition();
+        };
+        handle.addEventListener('pointerup', endDrag);
+        handle.addEventListener('pointercancel', endDrag);
     }
 
     function toggleScriptState() {
@@ -1106,7 +1284,7 @@ ${USER_PROFILE}
     }
 
     function resetScriptStats() {
-        if (confirm('Сбросить статистику и логи?')) {
+        if (confirm('Очистить статистику и лог? (Счетчик дневного лимита не изменится)')) {
             state.scanned = 0; state.applied = 0; state.skipped = 0; state.logs = [];
             saveState();
         }
@@ -1128,6 +1306,17 @@ ${USER_PROFILE}
         document.getElementById('hh-stat-scanned').textContent = state.scanned;
         document.getElementById('hh-stat-applied').textContent = state.applied;
         document.getElementById('hh-stat-skipped').textContent = state.skipped;
+
+        ensureToday();
+        const limitToday = document.getElementById('hh-limit-today');
+        if (limitToday) {
+            limitToday.textContent = state.todayApplied;
+            document.getElementById('hh-limit-max').textContent = CONFIG.applyLimit;
+            const pct = Math.min(100, Math.round(state.todayApplied / CONFIG.applyLimit * 100));
+            const bar = document.getElementById('hh-limit-bar');
+            bar.style.width = pct + '%';
+            bar.style.background = pct >= 100 ? '#dc2626' : pct >= 80 ? '#f59e0b' : '#10b981';
+        }
 
         const currentProvider = AI_PROVIDERS[CONFIG.aiProvider];
         const currentModel = CONFIG[CONFIG.aiProvider + 'Model'];
@@ -1158,34 +1347,11 @@ ${USER_PROFILE}
         }
     }
 
-    function dragElement(elmnt, header) {
-        let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-        header.onmousedown = dragMouseDown;
-        function dragMouseDown(e) {
-            if (e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
-            e.preventDefault();
-            pos3 = e.clientX; pos4 = e.clientY;
-            document.onmouseup = closeDragElement;
-            document.onmousemove = elementDrag;
-        }
-        function elementDrag(e) {
-            e.preventDefault();
-            pos1 = pos3 - e.clientX; pos2 = pos4 - e.clientY;
-            pos3 = e.clientX; pos4 = e.clientY;
-            elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
-            elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
-            elmnt.style.bottom = "auto"; elmnt.style.right = "auto";
-        }
-        function closeDragElement() {
-            document.onmouseup = null; document.onmousemove = null;
-        }
-    }
-
     async function runScannerLifecycle() {
         if (!state.active) return;
-        if (state.applied >= CONFIG.applyLimit) {
-            addLog('info', 'System', 'Engine', '-', 'Лимит достигнут! Остановка.');
-            state.active = false; saveState(); return;
+        if (isDailyLimitReached()) {
+            stopOnDailyLimit();
+            return;
         }
 
         const cards = document.querySelectorAll('[data-qa="vacancy-serp__vacancy"], [data-qa="serp-item"], .serp-item, .vacancy-card');
@@ -1196,6 +1362,11 @@ ${USER_PROFILE}
 
         for (let i = 0; i < cards.length; i++) {
             if (!state.active) return;
+            // Лимит проверяем перед каждой вакансией, а не только при старте страницы
+            if (isDailyLimitReached()) {
+                stopOnDailyLimit();
+                return;
+            }
             const card = cards[i];
             if (card.dataset.hhAutoScanned === 'true') continue;
             card.dataset.hhAutoScanned = 'true';
@@ -1578,7 +1749,8 @@ ${USER_PROFILE}
                         if (hasSubmitted || (hasConfirmedRegion && ticksWithoutModal > 6)) {
                             clearInterval(checkInterval);
                             addLog('applied', jobTitle, companyName, '-', '✅ Отклик отправлен!');
-                            state.applied++; saveState();
+                            ensureToday();
+                            state.applied++; state.todayApplied++; saveState();
                             resolve(true);
                             return;
                         }
