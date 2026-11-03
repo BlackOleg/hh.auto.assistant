@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.5)
+// @name         HH.ru Auto-Apply Assistant (Multi-AI v5.6)
 // @namespace    http://tampermonkey.net/
-// @version      5.5
+// @version      5.6
 // @description  Умный автоотклик на hh.ru с поддержкой Gemini, Claude и Qwen.
 // @author       HH Auto-Apply Builder
 // @match        https://*.hh.ru/search/*
@@ -242,7 +242,7 @@
         });
     }
 
-    const SCRIPT_VERSION = '5.5';
+    const SCRIPT_VERSION = '5.6';
 
     function escapeHtml(value) {
         return String(value == null ? '' : value)
@@ -1069,7 +1069,7 @@ ${USER_PROFILE}
                 <div style="background: #1f2937; padding: 10px; border-radius: 8px; font-size: 11px; display: flex; flex-direction: column; gap: 4px;">
                     <label style="font-weight: 600; color: #fbbf24;">❓ При вопросах работодателя:</label>
                     <select id="hh-select-questions" style="background: #374151; color: #f3f4f6; border: 1px solid #4b5563; border-radius: 4px; padding: 4px; outline: none; width: 100%; cursor: pointer;">
-                        <option value="notify" ${CONFIG.questionsAction === 'notify' ? 'selected' : ''}>Просить вмешаться (звук + пауза)</option>
+                        <option value="notify" ${CONFIG.questionsAction === 'notify' ? 'selected' : ''}>Заполнить ответы ИИ и ждать моей проверки (звук)</option>
                         <option value="skip" ${CONFIG.questionsAction === 'skip' ? 'selected' : ''}>Пропускать такие вакансии</option>
                     </select>
                 </div>
@@ -1371,6 +1371,10 @@ ${USER_PROFILE}
             if (card.dataset.hhAutoScanned === 'true') continue;
             card.dataset.hhAutoScanned = 'true';
 
+            // Вакансии, которые уже обрабатывали (например, до возврата со страницы отклика), пропускаем молча
+            const cardLink = Array.from(card.querySelectorAll('a[href*="/vacancy/"]')).find(a => getVacancyId(a.href));
+            if (cardLink && getProcessedIds().includes(getVacancyId(cardLink.href))) continue;
+
             state.scanned++; saveState();
 
             const titleEl = card.querySelector('[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], .serp-item__title, a.bloko-link, [data-qa="vacancy-card-title"]');
@@ -1409,16 +1413,25 @@ ${USER_PROFILE}
                 const vacancyLink = card.querySelector('a[data-qa="serp-item__title"]') ||
                     Array.from(card.querySelectorAll('a[href*="/vacancy/"]')).find(a => getVacancyId(a.href));
                 const vacancyUrl = vacancyLink ? vacancyLink.href : null;
+                const vacancyId = getVacancyId(vacancyUrl) || getVacancyId(applyBtn.getAttribute('href'));
 
                 // Письмо готовим ДО открытия формы: генерация может занять десятки секунд
                 // и не должна съедать таймаут модального окна.
-                const coverLetter = await prepareCoverLetter(title, company, vacancyUrl);
+                const prepared = await prepareCoverLetter(title, company, vacancyUrl);
                 if (!state.active) return;
+                markVacancyProcessed(vacancyId);
+
+                // Если hh.ru откроет отдельную страницу отклика — передаем туда письмо и адрес возврата
+                GM_setValue(PENDING_RESPONSE_KEY, JSON.stringify({
+                    vacancyId, title, company, letter: prepared.letter, description: prepared.description,
+                    returnUrl: location.href, ts: Date.now()
+                }));
 
                 applyBtn.click();
                 addLog('info', title, company, salary, 'Открытие формы отклика...');
 
-                await handleResponseModalLifecycle(title, company, coverLetter);
+                const result = await handleResponseModalLifecycle(title, company, prepared.letter, prepared.description);
+                if (result === 'response-page') return; // дальше работает handleResponsePage
                 await new Promise(resolve => setTimeout(resolve, 2000));
             } else {
                 addLog('skipped', title, company, salary, 'Кнопка отклика не найдена');
@@ -1428,13 +1441,14 @@ ${USER_PROFILE}
         addLog('info', 'Page Scan', 'Engine', '-', 'Страница обработана.');
     }
 
+    // Возвращает { letter, description }: описание пригодится для ответов на вопросы работодателя
     async function prepareCoverLetter(jobTitle, companyName, vacancyUrl) {
-        if (CONFIG.coverLetterMode !== 'ai') return fillTemplate(jobTitle, companyName);
+        if (CONFIG.coverLetterMode !== 'ai') return { letter: fillTemplate(jobTitle, companyName), description: '' };
 
         const currentApiKey = CONFIG[CONFIG.aiProvider + 'ApiKey'];
         if (!currentApiKey) {
             addLog('info', jobTitle, companyName, '-', `⚠️ API ключ ${AI_PROVIDERS[CONFIG.aiProvider].name} не указан. Использую шаблон.`);
-            return fillTemplate(jobTitle, companyName);
+            return { letter: fillTemplate(jobTitle, companyName), description: '' };
         }
 
         addLog('info', jobTitle, companyName, '-', '📥 Загрузка описания вакансии...');
@@ -1446,13 +1460,13 @@ ${USER_PROFILE}
         const aiLetter = await generateAICoverLetter(jobTitle, companyName, description);
         if (aiLetter) {
             addLog('info', jobTitle, companyName, '-', '✅ Письмо под вакансию сгенерировано');
-            return aiLetter;
+            return { letter: aiLetter, description };
         }
         addLog('info', jobTitle, companyName, '-', '⚠️ Ошибка ИИ. Использую шаблон.');
-        return fillTemplate(jobTitle, companyName);
+        return { letter: fillTemplate(jobTitle, companyName), description };
     }
 
-    async function handleResponseModalLifecycle(jobTitle, companyName, preparedLetter) {
+    async function handleResponseModalLifecycle(jobTitle, companyName, preparedLetter, vacancyDescription) {
         const MODAL_TIMEOUT = 60000;
         const startTime = Date.now();
 
@@ -1498,44 +1512,28 @@ ${USER_PROFILE}
                 return modal.querySelector('textarea[data-qa*="letter"], textarea[name*="letter"], textarea.bloko-textarea, .vacancy-response-letter-input textarea') || modal.querySelector('textarea');
             }
 
-            function alertUser(message) {
-                addLog('info', jobTitle, companyName, '-', `⚠️ ${message}`);
-                const header = document.getElementById('hh-panel-header');
-                if (header) {
-                    header.style.background = '#dc2626';
-                    const headerTitle = header.querySelector('strong');
-                    if (headerTitle) headerTitle.textContent = '️ ТРЕБУЕТСЯ ВНИМАНИЕ!';
-                }
-                try {
-                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    for (let i = 0; i < 3; i++) {
-                        setTimeout(() => {
-                            const osc = audioCtx.createOscillator();
-                            const gain = audioCtx.createGain();
-                            osc.connect(gain); gain.connect(audioCtx.destination);
-                            osc.frequency.setValueAtTime(880, audioCtx.currentTime);
-                            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
-                            osc.start(); osc.stop(audioCtx.currentTime + 0.2);
-                        }, i * 300);
-                    }
-                } catch(e) {}
-                if ("Notification" in window && Notification.permission === "granted") {
-                    new Notification("HH Auto-Apply: Требуется внимание", { body: message });
-                }
-            }
+            const alertModal = (message) => alertUser(message, jobTitle, companyName);
 
             const checkInterval = setInterval(async () => {
                 const elapsed = Date.now() - startTime;
                 if (elapsed > MODAL_TIMEOUT) {
                     clearInterval(checkInterval);
-                    alertUser(`Превышен таймаут (${MODAL_TIMEOUT/1000}с). Процесс прерван.`);
+                    alertModal(`Превышен таймаут (${MODAL_TIMEOUT/1000}с). Процесс прерван.`);
                     state.skipped++; saveState();
                     resolve(false);
                     return;
                 }
                 if (elapsed > 30000 && !timeoutWarningShown) {
                     timeoutWarningShown = true;
-                    alertUser(`Процесс затянулся (${Math.floor(elapsed/1000)}с). Проверьте страницу!`);
+                    alertModal(`Процесс затянулся (${Math.floor(elapsed/1000)}с). Проверьте страницу!`);
+                }
+
+                // hh.ru открыл отдельную страницу отклика (без перезагрузки) — передаем управление ей
+                if (isResponsePage()) {
+                    clearInterval(checkInterval);
+                    resolve('response-page');
+                    handleResponsePage();
+                    return;
                 }
 
                 if (isProcessingTick) return;
@@ -1601,17 +1599,18 @@ ${USER_PROFILE}
                                 setTimeout(() => resolve(false), 1000);
                                 return;
                             } else {
-                                alertUser('ТРЕБУЮТСЯ ОТВЕТЫ НА ВОПРОСЫ РАБОТОДАТЕЛЯ!');
+                                // Заполняем все, что можем, и ждем, пока пользователь проверит и отправит сам
                                 clearInterval(checkInterval);
+                                await selectResumeIn(modal);
+                                const letterTextarea = await openAndFillLetter(modal, preparedLetter || fillTemplate(jobTitle, companyName), jobTitle, companyName);
+                                const questions = findQuestions(modal, letterTextarea);
+                                await answerQuestionsWithAI(questions, jobTitle, companyName, vacancyDescription);
+                                highlightForReview(findSubmitButton(modal), questions[0] && (questions[0].el || questions[0].inputs[0]));
+                                alertModal('Вопросы работодателя заполнены ИИ. Проверьте ответы и письмо, затем нажмите «Откликнуться».');
                                 const modalCheck = setInterval(() => {
                                     if (!findActiveModal()) {
                                         clearInterval(modalCheck);
-                                        const hdr = document.getElementById('hh-panel-header');
-                                        if (hdr) {
-                                            hdr.style.background = '#1f2937';
-                                            const headerTitle = hdr.querySelector('strong');
-                                            if (headerTitle) headerTitle.textContent = `HH Auto-Apply v${SCRIPT_VERSION}`;
-                                        }
+                                        clearAlert();
                                         addLog('info', jobTitle, companyName, '-', 'Продолжаю сканирование...');
                                         resolve(true);
                                     }
@@ -1768,6 +1767,457 @@ ${USER_PROFILE}
         });
     }
 
+    // ===================== Страница отклика /applicant/vacancy_response =====================
+    // hh.ru иногда вместо всплывающего окна открывает отдельную страницу отклика
+    // (обычно когда у работодателя есть вопросы). Здесь мы выбираем резюме,
+    // вставляем письмо, пытаемся ответить на вопросы через ИИ и:
+    //  - если вопросов нет — отправляем отклик сами;
+    //  - если вопросы есть — подаем сигнал и ждем, пока пользователь проверит и нажмет «Откликнуться».
+
+    const PENDING_RESPONSE_KEY = 'autoApplyPendingResponse';   // данные вакансии, переданные со страницы поиска
+    const SUBMIT_PENDING_KEY = 'autoApplySubmitPending';        // отклик отправлен, ждем подтверждения на следующей странице
+    const PROCESSED_IDS_KEY = 'autoApplyProcessedIds';
+
+    function isResponsePage() {
+        return /\/applicant\/vacancy_response/.test(location.pathname);
+    }
+
+    function readJsonValue(key) {
+        try { return JSON.parse(GM_getValue(key, 'null')); } catch (e) { return null; }
+    }
+
+    function getProcessedIds() {
+        return readJsonValue(PROCESSED_IDS_KEY) || [];
+    }
+
+    function markVacancyProcessed(vacancyId) {
+        if (!vacancyId) return;
+        const ids = getProcessedIds().filter(id => id !== vacancyId);
+        ids.push(vacancyId);
+        GM_setValue(PROCESSED_IDS_KEY, JSON.stringify(ids.slice(-1000)));
+    }
+
+    function sleep(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function waitFor(fn, timeoutMs, intervalMs = 300) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const result = fn();
+            if (result) return result;
+            await sleep(intervalMs);
+        }
+        return null;
+    }
+
+    function isOwnUi(el) {
+        return !!el.closest('#hh-auto-apply-panel, #hh-settings-modal');
+    }
+
+    function isVisible(el) {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+    }
+
+    // React-поля не видят присваивания .value — используем нативный сеттер и события
+    function setNativeValue(el, value) {
+        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        el.focus();
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, value);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.blur();
+    }
+
+    function playAlertSound() {
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            for (let i = 0; i < 3; i++) {
+                setTimeout(() => {
+                    const osc = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    osc.connect(gain); gain.connect(audioCtx.destination);
+                    osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+                    gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+                    osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+                }, i * 300);
+            }
+        } catch (e) { /* звук недоступен */ }
+    }
+
+    function alertUser(message, jobTitle, companyName) {
+        addLog('info', jobTitle || 'System', companyName || 'Engine', '-', `⚠️ ${message}`);
+        const header = document.getElementById('hh-panel-header');
+        if (header) {
+            header.style.background = '#dc2626';
+            const headerTitle = header.querySelector('strong');
+            if (headerTitle) headerTitle.textContent = '⚠️ ТРЕБУЕТСЯ ВНИМАНИЕ!';
+        }
+        playAlertSound();
+        if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification('HH Auto-Apply: Требуется внимание', { body: message });
+        }
+    }
+
+    function clearAlert() {
+        const header = document.getElementById('hh-panel-header');
+        if (header) {
+            header.style.background = '#1f2937';
+            const headerTitle = header.querySelector('strong');
+            if (headerTitle) headerTitle.textContent = `HH Auto-Apply v${SCRIPT_VERSION}`;
+        }
+    }
+
+    async function selectResumeIn(container) {
+        const wanted = (CONFIG.selectedResumeTitle || '').toLowerCase().trim();
+        if (!wanted) return false;
+        try {
+            const nativeSelect = container.querySelector('select');
+            if (nativeSelect) {
+                for (const opt of nativeSelect.querySelectorAll('option')) {
+                    if ((opt.textContent || '').toLowerCase().includes(wanted)) {
+                        nativeSelect.value = opt.value;
+                        nativeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                }
+            }
+            const resumeItems = container.querySelectorAll('[data-qa="resume-select-item"], label, .bloko-radio, [class*="resume-select"]');
+            for (const item of resumeItems) {
+                if (isOwnUi(item)) continue;
+                if ((item.textContent || '').toLowerCase().includes(wanted)) {
+                    const input = item.querySelector('input[type="radio"], .bloko-radio__input');
+                    if (input) { if (!input.checked) input.click(); return true; }
+                    if (item.matches('[data-qa="resume-select-item"]')) { item.click(); return true; }
+                }
+            }
+            // Выпадающий список: если нужное резюме уже выбрано — ничего не трогаем
+            const dropdown = Array.from(container.querySelectorAll('[data-qa="resume-select-container"], [data-qa*="resume"][role="button"], [role="combobox"], .bloko-select, div[class*="select"]'))
+                .find(el => !isOwnUi(el) && isVisible(el));
+            if (dropdown) {
+                if ((dropdown.textContent || '').toLowerCase().includes(wanted)) return true;
+                dropdown.click();
+                await sleep(500);
+                for (const item of document.querySelectorAll('[role="option"], [data-qa*="resume"], .bloko-select-dropdown-item, [class*="select-dropdown"] div, [class*="drop"] [class*="cell"]')) {
+                    if (isOwnUi(item)) continue;
+                    if ((item.textContent || '').toLowerCase().includes(wanted)) {
+                        item.click();
+                        return true;
+                    }
+                }
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            }
+        } catch (err) {
+            console.error('Error selecting resume:', err);
+        }
+        return false;
+    }
+
+    function isLetterField(el) {
+        const attrs = `${el.getAttribute('data-qa') || ''} ${el.getAttribute('name') || ''} ${el.className || ''}`.toLowerCase();
+        return attrs.includes('letter');
+    }
+
+    function findSubmitButton(container) {
+        const known = container.querySelector('[data-qa="vacancy-response-submit-popup"], [data-qa="vacancy-response-letter-submit"], [data-qa="vacancy-response-submit-button"]');
+        if (known && !isOwnUi(known)) return known;
+        return Array.from(container.querySelectorAll('button, input[type="submit"]'))
+            .find(btn => !isOwnUi(btn) && isVisible(btn) && /^откликнуться$/i.test((btn.textContent || btn.value || '').trim())) || null;
+    }
+
+    // Нажимает «Добавить» у сопроводительного письма и вставляет текст
+    async function openAndFillLetter(container, letter, jobTitle, companyName) {
+        if (!letter) return null;
+        let textarea = Array.from(container.querySelectorAll('textarea')).find(ta => !isOwnUi(ta) && isLetterField(ta));
+        if (!textarea) {
+            const before = new Set(container.querySelectorAll('textarea'));
+            let addBtn = container.querySelector('[data-qa="vacancy-response-letter-toggle"], [data-qa="vacancy-response-letter-add"], [data-qa*="letter"][role="button"]');
+            if (!addBtn) {
+                addBtn = Array.from(container.querySelectorAll('button, a, span[role="button"], div[role="button"]')).find(btn => {
+                    if (isOwnUi(btn)) return false;
+                    const txt = (btn.textContent || '').trim().toLowerCase();
+                    if (txt.includes('добавить сопроводительное')) return true;
+                    if (txt !== 'добавить') return false;
+                    // «Добавить» именно в блоке сопроводительного письма
+                    let node = btn.parentElement;
+                    for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+                        if ((node.textContent || '').toLowerCase().includes('сопроводительн')) return true;
+                    }
+                    return false;
+                });
+            }
+            if (addBtn) {
+                addLog('info', jobTitle, companyName, '-', '📝 Нажимаю «Добавить» у сопроводительного письма...');
+                addBtn.click();
+                textarea = await waitFor(() =>
+                    Array.from(container.querySelectorAll('textarea')).find(ta => !isOwnUi(ta) && (isLetterField(ta) || !before.has(ta))), 4000);
+            }
+        }
+        if (!textarea) {
+            addLog('info', jobTitle, companyName, '-', '⚠️ Поле сопроводительного письма не найдено');
+            return null;
+        }
+        setNativeValue(textarea, letter);
+        addLog('info', jobTitle, companyName, '-', '✏️ Сопроводительное письмо вставлено');
+        return textarea;
+    }
+
+    function questionTextFor(el) {
+        const block = el.closest('[data-qa="task-body"], [data-qa*="question"], fieldset');
+        const explicit = block && block.querySelector('[data-qa="task-question"], [data-qa*="question-text"], legend');
+        if (explicit && explicit.textContent.trim()) return explicit.textContent.replace(/\s+/g, ' ').trim();
+        let node = block || el.parentElement;
+        for (let i = 0; i < 6 && node && node !== document.body; i++, node = node.parentElement) {
+            const clone = node.cloneNode(true);
+            clone.querySelectorAll('label, textarea, input, select, button, [role="radio"], [role="checkbox"]').forEach(n => n.remove());
+            const text = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text.length > 3 && text.length < 800) return text;
+        }
+        return '';
+    }
+
+    function optionLabelFor(input) {
+        const label = input.closest('label') || (input.id && document.querySelector(`label[for="${CSS.escape(input.id)}"]`));
+        const text = ((label && label.textContent) || input.getAttribute('aria-label') || input.value || '').replace(/\s+/g, ' ').trim();
+        return text;
+    }
+
+    // Ищет вопросы работодателя: текстовые поля и группы вариантов ответа
+    function findQuestions(container, letterTextarea) {
+        const ignored = (el) => isOwnUi(el) || el === letterTextarea || isLetterField(el) || el.disabled ||
+            el.type === 'hidden' || el.closest('header, nav, [data-qa*="header"], [data-qa*="search"], [data-qa*="resume"]');
+        const questions = [];
+
+        container.querySelectorAll('textarea, input[type="text"], input:not([type])').forEach(el => {
+            if (ignored(el) || !isVisible(el)) return;
+            questions.push({ type: 'text', el, question: questionTextFor(el) });
+        });
+
+        const groups = new Map();
+        container.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(el => {
+            if (ignored(el)) return;
+            const key = el.name || questionTextFor(el);
+            if (!groups.has(key)) groups.set(key, { type: el.type === 'radio' ? 'single' : 'multiple', inputs: [] });
+            groups.get(key).inputs.push(el);
+        });
+        for (const group of groups.values()) {
+            questions.push({
+                type: group.type,
+                inputs: group.inputs,
+                options: group.inputs.map(optionLabelFor),
+                question: questionTextFor(group.inputs[0].closest('[data-qa="task-body"], fieldset') || group.inputs[0].parentElement.parentElement || group.inputs[0])
+            });
+        }
+        return questions.filter(q => q.question || q.type !== 'text');
+    }
+
+    function callAI(prompt) {
+        if (CONFIG.aiProvider === 'gemini') return generateWithGemini(prompt);
+        if (CONFIG.aiProvider === 'claude') return generateWithClaude(prompt);
+        if (CONFIG.aiProvider === 'qwen') return generateWithQwen(prompt);
+        return Promise.reject(new Error(`Неизвестный провайдер: ${CONFIG.aiProvider}`));
+    }
+
+    // Отвечает на вопросы работодателя через ИИ. Возвращает число заполненных вопросов.
+    async function answerQuestionsWithAI(questions, jobTitle, companyName, description) {
+        if (!questions.length) return 0;
+        if (!CONFIG[CONFIG.aiProvider + 'ApiKey']) {
+            addLog('info', jobTitle, companyName, '-', '⚠️ Нет API ключа ИИ — ответьте на вопросы сами');
+            return 0;
+        }
+        const list = questions.map((q, i) => ({
+            id: i + 1,
+            type: q.type,
+            question: q.question || '(текст вопроса не найден)',
+            ...(q.options ? { options: q.options } : {})
+        }));
+        const prompt = {
+            system: 'Вы помогаете соискателю заполнить анкету работодателя на hh.ru. Отвечаете от первого лица, кратко и по делу, только на основе фактов из профиля кандидата. Если в профиле нет данных для ответа, дайте нейтральный честный ответ (например, «готов обсудить на собеседовании»), не выдумывайте факты.',
+            user: `Вакансия: "${jobTitle}" в компании "${companyName}".
+
+<описание_вакансии>
+${(description || 'нет описания').substring(0, 6000)}
+</описание_вакансии>
+
+<мой_профиль>
+${USER_PROFILE}
+</мой_профиль>
+
+<вопросы>
+${JSON.stringify(list, null, 2)}
+</вопросы>
+
+Ответьте на каждый вопрос на языке вопроса. Для type "text" — текст ответа (1-4 предложения). Для type "single" — индекс одного варианта из options (с 0). Для type "multiple" — массив индексов подходящих вариантов.
+Верните ТОЛЬКО JSON без пояснений в формате:
+{"answers": [{"id": 1, "text": "..."}, {"id": 2, "choice": 0}, {"id": 3, "choices": [0, 2]}]}`
+        };
+
+        addLog('info', jobTitle, companyName, '-', `🤖 Отвечаю на вопросы работодателя (${questions.length}) через ${AI_PROVIDERS[CONFIG.aiProvider].name}...`);
+        let parsed;
+        try {
+            const raw = await callAI(prompt);
+            const json = raw.substring(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+            parsed = JSON.parse(json);
+        } catch (e) {
+            addLog('info', jobTitle, companyName, '-', `⚠️ ИИ не смог ответить на вопросы: ${e.message}`);
+            return 0;
+        }
+
+        let filled = 0;
+        for (const answer of (parsed.answers || [])) {
+            const q = questions[answer.id - 1];
+            if (!q) continue;
+            try {
+                if (q.type === 'text' && typeof answer.text === 'string' && answer.text.trim()) {
+                    setNativeValue(q.el, answer.text.trim());
+                    filled++;
+                } else if (q.type === 'single' && Number.isInteger(answer.choice) && q.inputs[answer.choice]) {
+                    if (!q.inputs[answer.choice].checked) q.inputs[answer.choice].click();
+                    filled++;
+                } else if (q.type === 'multiple' && Array.isArray(answer.choices)) {
+                    answer.choices.forEach(idx => {
+                        const input = q.inputs[idx];
+                        if (input && !input.checked) input.click();
+                    });
+                    filled++;
+                }
+            } catch (e) { /* поле могло пропасть из DOM */ }
+        }
+        addLog('info', jobTitle, companyName, '-', `✅ ИИ заполнил ответы: ${filled} из ${questions.length}`);
+        return filled;
+    }
+
+    function highlightForReview(submitBtn, firstField) {
+        if (submitBtn) {
+            submitBtn.style.outline = '4px solid #f59e0b';
+            submitBtn.style.outlineOffset = '3px';
+        }
+        const target = firstField || submitBtn;
+        if (target && target.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    // Отклик засчитываем, когда hh.ru подтвердил отправку (сообщение на странице или переход на другую страницу)
+    function finalizeSubmittedResponse(info) {
+        GM_setValue(SUBMIT_PENDING_KEY, 'null');
+        clearAlert();
+        ensureToday();
+        state.applied++; state.todayApplied++; saveState();
+        addLog('applied', info.title, info.company, '-', info.byUser ? '✅ Отклик отправлен (подтвержден вами)' : '✅ Отклик отправлен');
+        if (state.active && info.returnUrl && info.returnUrl !== location.href) {
+            addLog('info', 'System', 'Engine', '-', '↩️ Возвращаюсь к списку вакансий...');
+            setTimeout(() => { location.href = info.returnUrl; }, 2000);
+        }
+    }
+
+    function pageShowsSuccess() {
+        const text = (document.body.textContent || '').toLowerCase();
+        return text.includes('отклик отправлен') || text.includes('резюме доставлено') || text.includes('вы откликнулись');
+    }
+
+    async function watchSubmitResult(info) {
+        GM_setValue(SUBMIT_PENDING_KEY, JSON.stringify({ ...info, ts: Date.now() }));
+        const ok = await waitFor(() => pageShowsSuccess() || !isResponsePage() || !findSubmitButton(document), 15000, 500);
+        if (ok) {
+            finalizeSubmittedResponse(info);
+        } else {
+            // Остались на форме — скорее всего hh.ru показал ошибку валидации
+            GM_setValue(SUBMIT_PENDING_KEY, 'null');
+            alertUser('Похоже, отклик не отправился: проверьте ошибки в форме и нажмите «Откликнуться» еще раз.', info.title, info.company);
+        }
+    }
+
+    // Вызывается при загрузке любой страницы: подтверждает отклик, если отправка увела нас на другую страницу
+    function checkSubmitPendingOnLoad() {
+        const pending = readJsonValue(SUBMIT_PENDING_KEY);
+        if (!pending) return false;
+        if (Date.now() - pending.ts > 120000 || (isResponsePage() && !pageShowsSuccess())) {
+            GM_setValue(SUBMIT_PENDING_KEY, 'null');
+            return false;
+        }
+        finalizeSubmittedResponse(pending);
+        return true;
+    }
+
+    let responsePageHandled = false;
+
+    async function handleResponsePage() {
+        if (responsePageHandled || !state.active) return;
+        responsePageHandled = true;
+
+        const vacancyId = new URLSearchParams(location.search).get('vacancyId');
+        const pending = readJsonValue(PENDING_RESPONSE_KEY);
+        const fromSearch = pending && pending.vacancyId === vacancyId && Date.now() - pending.ts < 15 * 60000 ? pending : null;
+        GM_setValue(PENDING_RESPONSE_KEY, 'null');
+
+        const returnUrl = fromSearch ? fromSearch.returnUrl : (document.referrer && !/vacancy_response/.test(document.referrer) ? document.referrer : '');
+        let title = fromSearch ? fromSearch.title : '';
+        let company = fromSearch ? fromSearch.company : '';
+        markVacancyProcessed(vacancyId);
+
+        addLog('info', title || 'Vacancy', company || '-', '-', '📄 Открыта отдельная страница отклика');
+
+        const submitBtn = await waitFor(() => findSubmitButton(document), 15000);
+        if (!submitBtn) {
+            alertUser('Страница отклика не распознана: кнопка «Откликнуться» не найдена. Завершите отклик вручную.', title, company);
+            return;
+        }
+        const container = submitBtn.closest('form') || document.querySelector('main') || document.body;
+        await sleep(800); // даем React дорисовать форму
+
+        if (!title) {
+            const heading = Array.from(document.querySelectorAll('a[href*="/vacancy/"]')).find(a => getVacancyId(a.href) === vacancyId && a.textContent.trim());
+            title = heading ? heading.textContent.trim() : 'Vacancy';
+            company = company || 'Employer';
+        }
+
+        if (isDailyLimitReached()) {
+            stopOnDailyLimit();
+            return;
+        }
+
+        await selectResumeIn(container);
+
+        // Письмо: берем подготовленное на странице поиска, иначе генерируем сейчас
+        let letter = fromSearch && fromSearch.letter;
+        let description = fromSearch && fromSearch.description;
+        if (!letter) {
+            const prepared = await prepareCoverLetter(title, company, `${location.origin}/vacancy/${vacancyId}`);
+            letter = prepared.letter;
+            description = prepared.description;
+        }
+        const letterTextarea = await openAndFillLetter(container, letter, title, company);
+
+        const questions = findQuestions(container, letterTextarea);
+        const info = { vacancyId, title, company, returnUrl, byUser: false };
+
+        if (!questions.length) {
+            addLog('info', title, company, '-', '✅ Вопросов нет — отправляю отклик');
+            await sleep(1000);
+            submitBtn.click();
+            await watchSubmitResult(info);
+            return;
+        }
+
+        if (CONFIG.questionsAction === 'skip') {
+            addLog('skipped', title, company, '-', `⚠️ Пропуск: вопросы работодателя (${questions.length})`);
+            state.skipped++; saveState();
+            if (returnUrl) setTimeout(() => { location.href = returnUrl; }, 1500);
+            return;
+        }
+
+        await answerQuestionsWithAI(questions, title, company, description);
+        highlightForReview(submitBtn, questions[0].el || (questions[0].inputs && questions[0].inputs[0]));
+        alertUser(`Вопросы работодателя (${questions.length}) заполнены. Проверьте ответы и письмо, затем нажмите «Откликнуться».`, title, company);
+
+        // Пользователь сам нажимает «Откликнуться» — ловим нажатие и ждем результата
+        const onSubmit = () => {
+            submitBtn.style.outline = '';
+            watchSubmitResult({ ...info, byUser: true });
+        };
+        submitBtn.addEventListener('click', onSubmit, { capture: true });
+    }
+
     function exportLogsToCSV() {
         if (state.logs.length === 0) { alert('Нет логов для экспорта!'); return; }
         let csvContent = "data:text/csv;charset=utf-8,Timestamp,Status,Vacancy Title,Company,Salary,Details/Reason\n";
@@ -1790,8 +2240,14 @@ ${USER_PROFILE}
 
     setTimeout(() => {
         initUI();
+        // Отклик был отправлен и hh.ru перевел нас на другую страницу — засчитываем и возвращаемся к поиску
+        if (checkSubmitPendingOnLoad()) return;
         // Состояние «активен» сохраняется между страницами — продолжаем работу после перехода/перезагрузки
         if (state.active) {
+            if (isResponsePage()) {
+                handleResponsePage();
+                return;
+            }
             addLog('info', 'System', 'Engine', '-', 'Продолжаю автоотклик на новой странице...');
             runScannerLifecycle();
         }
